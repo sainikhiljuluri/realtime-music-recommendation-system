@@ -1,0 +1,12 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  api:
+    build: .
+    depends_on: [redis]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CACHE_TTL: "300"
+    ports: ["8000:8000"]
