@@ -50,3 +50,12 @@ What deletion does **not** do:
 - Per-user authentication for self-service deletion
 - Differential privacy or other formal privacy guarantees for training
 - Automated log expiry, data-subject access requests, and retraining after deletion
+
+
+## Listen events (online features)
+
+- **What is stored.** `POST /users/{id}/listens` keeps, per user, the set of applied `event_id`s and the list of applied track indices, in process memory. Those feed the online genre profile, activity, seen set, and popularity counts. Raw listen events (timestamps and track ids) are not written to disk or to logs. Logs carry only the HMAC pseudonym of the user id.
+- **Retention.** Online state lasts until the process restarts, the user is deleted through `DELETE /users/{id}/recommendations` (which reverses the user's updates), or the instance is replaced. Nothing is persisted, so a restart removes all listen updates. The deletion path is the same for cache entries and listen features.
+- **Limits.** `event_id` sets are not evicted. A process that receives many events holds that memory until restart. A user's state exists only on the instance that serves them, so the same user's data can sit on two instances after a failover, until restart.
+- **Access.** Listen ingestion needs `INGEST_API_KEY`. Deletion needs `ADMIN_API_KEY`. The two tokens are separate, so the event producer cannot delete data, and deletion does not grant ingestion.
+- **Metrics.** `/metrics` and `/stats` carry counts and timings only, with no user or track ids.

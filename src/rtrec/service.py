@@ -23,6 +23,7 @@ import numpy as np
 from .artifacts import CATALOG_FILE, CONFIG_FILE, FAISS_FILE, HISTORY_FILE, RANKER_FILE, VECTORS_FILE
 from .cache import NullCache
 from .hybrid import score_pool, select_top_k
+from .online import EventRejected, OnlineFeatures
 from .ranking import History
 
 log = logging.getLogger(__name__)
@@ -57,6 +58,8 @@ class Recommender:
     user_ids: np.ndarray | None = field(default=None, repr=False)      # music4all: sorted original ids
     item_ids: np.ndarray | None = field(default=None, repr=False)      # music4all: track id per dense item index
     trained_users: np.ndarray | None = field(default=None, repr=False)  # music4all: False = cold start
+    item_index: dict | None = field(default=None, repr=False)          # music4all: track id -> item index
+    online: OnlineFeatures | None = field(default=None, repr=False)    # music4all: incremental listen features
 
     def __post_init__(self) -> None:
         if self.popularity_order is None:
@@ -87,11 +90,14 @@ class Recommender:
         extra: dict[str, Any] = {}
         if family == "music4all":
             catalog = np.load(root / CATALOG_FILE)
+            item_ids = catalog["item_ids"].astype(str)
             extra = {
                 "user_ids": catalog["user_ids"].astype(np.int64),
-                "item_ids": catalog["item_ids"].astype(str),
+                "item_ids": item_ids,
                 "trained_users": catalog["trained_users"].astype(bool),
                 "selected_lambda": float(config["selected_lambda"]),
+                "item_index": {str(track): i for i, track in enumerate(item_ids)},
+                "online": OnlineFeatures(history=history, cutoff_unix=int(config["history_cutoff_unix"])),
             }
         elif family != "generic":
             raise ValueError(f"unknown model_family: {family}")
@@ -147,6 +153,34 @@ class Recommender:
             return pos
         return None
 
+    def _cache_user(self, user_id: str) -> str:
+        """Canonical user key for the cache, so "004" and "4" share entries and invalidation."""
+        if self.user_ids is not None and user_id.isdigit() and len(user_id) <= 18:
+            return str(int(user_id))
+        return user_id
+
+    @property
+    def ingestion_supported(self) -> bool:
+        return self.online is not None
+
+    def ingest(self, user_id: str, track_id: str, event_id: str, ts: int, now: int) -> str:
+        """Apply one listen event. Returns "accepted" or "duplicate". Raises EventRejected on invalid input.
+
+        Only known, trained users and known tracks are accepted. A new user needs a retrain.
+        """
+        if self.online is None:
+            raise EventRejected(501, "listen ingestion needs music4all artifacts")
+        user = self._user_index(user_id)
+        if user is None:
+            raise EventRejected(404, "unknown or untrained user")
+        item = self.item_index.get(track_id)
+        if item is None:
+            raise EventRejected(422, "unknown track")
+        status = self.online.apply(user, item, event_id, ts, now)
+        if status == "accepted":
+            self.cache.bump_generation(self._cache_user(user_id))
+        return status
+
     def _item_name(self, item: int) -> str:
         return str(self.item_ids[item]) if self.item_ids is not None else f"i{item}"
 
@@ -189,19 +223,32 @@ class Recommender:
 
     def recommend(self, user_id: str, k: int = 10) -> dict:
         self.stats.requests += 1
-        key = f"rec:{self.version}:{user_id}:{k}"
-        cached = self.cache.get(key)
-        if cached is not None:
-            self.stats.cache_hits += 1
-            return {**cached, "cache_hit": True}
+        cache_user = self._cache_user(user_id)
+        # The key carries the user's generation. A listen event bumps it, so older entries are never read.
+        # When Redis is unavailable the generation is None and the cache is skipped for this request.
+        generation = self.cache.generation(cache_user)
+        key = None if generation is None else f"rec:{self.version}:{cache_user}:{k}:g{generation}"
+        if key is not None:
+            cached = self.cache.get(key)
+            if cached is not None:
+                self.stats.cache_hits += 1
+                return {**cached, "cache_hit": True}
 
         result = self._compute(user_id, k)
         if result["source"] == "cold_start":
             self.stats.cold_starts += 1
         else:
             self.stats.personalized += 1
-        self.cache.set(key, result, self.ttl)
+        if key is not None:
+            self.cache.set(key, result, self.ttl)
         return {**result, "cache_hit": False}
+
+    def forget_listens(self, user_id: str) -> int:
+        """Reverse this user's online listen updates. Returns the number of events removed."""
+        user = self._user_index(user_id)
+        if self.online is None or user is None:
+            return 0
+        return self.online.forget(user)
 
     def purge_user(self, user_id: str) -> int:
         """Delete cached recommendations for one user (all k values and model versions)."""

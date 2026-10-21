@@ -7,6 +7,7 @@ penalty selected on validation.
 import dataclasses
 import json
 import shutil
+import time
 
 import numpy as np
 import pandas as pd
@@ -17,8 +18,9 @@ from rtrec import api as api_module
 from rtrec.artifacts import CATALOG_FILE
 from rtrec.cache import RedisCache
 from rtrec.hybrid import score_pool, select_top_k
-from rtrec.music_pipeline import MusicConfig, run
-from rtrec.ranking import History
+from rtrec.music_pipeline import MusicConfig, _items_frame, run
+from rtrec.online import EventRejected
+from rtrec.ranking import History, candidate_features
 from rtrec.service import Recommender
 from rtrec.telemetry import Telemetry
 
@@ -200,9 +202,8 @@ def test_metrics_endpoint_counts_sources_without_user_ids(music_run, monkeypatch
     with TestClient(api_module.app) as client:
         client.get(f"/recommendations/{USER_OFFSET + 2}", params={"k": 2})
         client.get("/recommendations/0", params={"k": 2})
-        snap = client.get("/metrics").json()
-        assert snap["counters"]["requests_total"] == 2
-        assert snap["counters"]["requests_cold_start"] == 1
+        snap = client.get("/stats").json()
+        assert snap["requests"] == {"personalized": 1, "cold_start": 1}
         assert snap["model_loaded"] is True
         assert str(USER_OFFSET + 2) not in json.dumps(snap)
 
@@ -212,7 +213,7 @@ def test_telemetry_percentiles_and_hit_rate():
     for ms in range(1, 101):
         t.observe("personalized", cache_hit=ms % 4 == 0, latency_ms=float(ms))
     snap = t.snapshot()
-    assert snap["counters"]["requests_total"] == 100
+    assert sum(snap["requests"].values()) == 100
     assert snap["cache_hit_rate"] == 0.25
     assert snap["latency"]["p50_ms"] == pytest.approx(50.5)
     assert snap["latency"]["p99_ms"] > snap["latency"]["p95_ms"] > snap["latency"]["p50_ms"]
@@ -230,3 +231,224 @@ def test_predict_uses_single_thread_to_avoid_openmp_crash():
 
     predict(Spy(), np.zeros((3, 2), dtype=np.float32))
     assert Spy.kwargs == {"num_threads": 1}
+
+
+# --- online listening features -------------------------------------------------------------
+
+
+
+def _cutoff(music_run) -> int:
+    return json.loads((music_run["export"] / "config.json").read_text())["history_cutoff_unix"]
+
+
+def _listen(rec, pos, item, event_id, ts):
+    return rec.ingest(str(int(rec.user_ids[pos])), _track_id(item), event_id, ts, int(time.time()))
+
+
+def _recent_ts(music_run) -> int:
+    return _cutoff(music_run) + 100
+
+
+def test_listen_rejects_unknown_track_user_and_stale_timestamps(music_run, rec):
+    pos = int(np.flatnonzero(rec.trained_users)[0])
+    uid = str(int(rec.user_ids[pos]))
+    ts = _recent_ts(music_run)
+    with pytest.raises(EventRejected) as bad_track:
+        rec.ingest(uid, "NOT-A-TRACK", "e1", ts, ts)
+    assert bad_track.value.status == 422
+    with pytest.raises(EventRejected) as bad_user:
+        rec.ingest("424242424", _track_id(1), "e2", ts, ts)
+    assert bad_user.value.status == 404
+    with pytest.raises(EventRejected) as stale:
+        rec.ingest(uid, _track_id(1), "e3", _cutoff(music_run) - 1, ts)
+    assert stale.value.status == 422
+    with pytest.raises(EventRejected) as future:
+        rec.ingest(uid, _track_id(1), "e4", ts + 10_000, ts)
+    assert future.value.status == 422
+
+
+def test_duplicate_event_id_changes_state_once(music_run, rec):
+    pos = int(np.flatnonzero(rec.trained_users)[0])
+    ts = _recent_ts(music_run)
+    before = rec.history.activity[pos]
+    assert _listen(rec, pos, 7, "same-id", ts) == "accepted"
+    assert _listen(rec, pos, 7, "same-id", ts) == "duplicate"
+    assert rec.history.activity[pos] == before + 1
+    assert rec.online.duplicates == 1
+
+
+def test_listen_updates_user_and_item_features(music_run, rec):
+    pos = int(np.flatnonzero(rec.trained_users)[0])
+    item = 9
+    genre = int(rec.history.item_genre[item])
+    activity, pop = rec.history.activity[pos], rec.history.item_popularity[item]
+    share = rec.history.genre_profile[pos, genre]
+    _listen(rec, pos, item, "f1", _recent_ts(music_run))
+    assert rec.history.activity[pos] == activity + 1
+    assert rec.history.item_popularity[item] == pop + 1
+    assert rec.history.genre_profile[pos].sum() == pytest.approx(1.0, abs=1e-5)
+    assert rec.history.genre_profile[pos, genre] > share
+    assert int(item) in rec.history.seen(pos).tolist()
+
+
+def test_listen_changes_genre_affinity_feature_of_candidates(music_run, rec):
+    pos = int(np.flatnonzero(rec.trained_users)[0])
+    cands = np.arange(20)
+    before = candidate_features(rec.history, pos, cands, np.zeros(20), np.arange(20)).copy()
+    genre_of_first = int(rec.history.item_genre[0])
+    same_genre = [int(i) for i in cands if rec.history.item_genre[i] == genre_of_first]
+    _listen(rec, pos, same_genre[-1] if len(same_genre) > 1 else 0, "g1", _recent_ts(music_run))
+    after = candidate_features(rec.history, pos, cands, np.zeros(20), np.arange(20))
+    affinity_col = 3
+    assert np.any(after[:, affinity_col] != before[:, affinity_col])
+
+
+def test_listened_track_is_removed_from_recommendations(music_run, rec):
+    pos = int(np.flatnonzero(rec.trained_users)[0])
+    uid = str(int(rec.user_ids[pos]))
+    top = rec.recommend(uid, k=5)["items"][0]["item_id"]
+    assert _listen(rec, pos, int(top[3:]), "rec1", _recent_ts(music_run)) == "accepted"
+    after = [item["item_id"] for item in rec.recommend(uid, k=5)["items"]]
+    assert top not in after
+
+
+def test_listen_invalidates_only_that_users_cache(music_run):
+    import fakeredis
+
+    from rtrec.cache import RedisCache
+
+    cache = RedisCache(fakeredis.FakeRedis())
+    rec = Recommender.load(music_run["export"], cache=cache, ttl=600)
+    pos = int(np.flatnonzero(rec.trained_users)[0])
+    other = int(np.flatnonzero(rec.trained_users)[1])
+    uid, other_uid = str(int(rec.user_ids[pos])), str(int(rec.user_ids[other]))
+    first = rec.recommend(uid, k=5)
+    assert rec.recommend(uid, k=5)["cache_hit"] is True
+    rec.recommend(other_uid, k=5)
+    top = first["items"][0]["item_id"]
+    _listen(rec, pos, int(top[3:]), "cache1", _recent_ts(music_run))
+    fresh = rec.recommend(uid, k=5)
+    assert fresh["cache_hit"] is False
+    assert top not in [item["item_id"] for item in fresh["items"]]
+    assert rec.recommend(other_uid, k=5)["cache_hit"] is True
+
+
+def test_event_order_does_not_change_features(music_run):
+    ts0 = _recent_ts(music_run)
+    events = [(7, f"o{i}", ts0 + i) for i in range(6)]
+    results = []
+    for ordering in (events, list(reversed(events))):
+        rec = Recommender.load(music_run["export"])
+        pos = int(np.flatnonzero(rec.trained_users)[0])
+        for item, eid, ts in ordering:
+            _listen(rec, pos, item, eid, ts)
+        results.append((rec.history.genre_profile.copy(), rec.history.activity.copy(),
+                        rec.history.item_popularity.copy(), sorted(rec.history.seen(pos).tolist())))
+    a, b = results
+    assert np.allclose(a[0], b[0]) and np.array_equal(a[1], b[1]) and np.array_equal(a[2], b[2]) and a[3] == b[3]
+
+
+def test_online_features_match_offline_rebuild(music_run):
+    """Applying listens online gives the same features as rebuilding History offline from all events."""
+    cutoff = _cutoff(music_run)
+    base = music_run["events"]
+    base = base[base["ts"] < cutoff]
+    rec = Recommender.load(music_run["export"])
+    pos_users = np.flatnonzero(rec.trained_users)[:6]
+    rng = np.random.default_rng(3)
+    new_rows = []
+    for n, pos in enumerate(pos_users):
+        for j in range(5):
+            item = int(rng.integers(0, N_ITEMS))
+            ts = cutoff + 60 * (n * 10 + j) + 1
+            _listen(rec, int(pos), item, f"c{n}-{j}", ts)
+            new_rows.append((int(pos), item, ts))
+    all_events = pd.concat([base, pd.DataFrame(new_rows, columns=["user_idx", "item_idx", "ts"])])
+    items = _items_frame(N_ITEMS, music_run["item_genre"], N_GENRES)
+    offline = History.from_events(all_events, items, N_USERS, N_GENRES + 1, 1)
+    np.testing.assert_allclose(rec.history.genre_profile, offline.genre_profile, atol=1e-5)
+    np.testing.assert_array_equal(rec.history.activity, offline.activity)
+    np.testing.assert_array_equal(rec.history.item_popularity, offline.item_popularity)
+    for u in range(N_USERS):
+        np.testing.assert_array_equal(rec.history.seen(u), offline.seen(u))
+
+
+def test_artifact_history_matches_offline_rebuild_before_any_listen(music_run):
+    """Sanity check for the consistency test: the saved history is the offline rebuild of pre-cutoff events."""
+    cutoff = _cutoff(music_run)
+    base = music_run["events"]
+    base = base[base["ts"] < cutoff]
+    rec = Recommender.load(music_run["export"])
+    items = _items_frame(N_ITEMS, music_run["item_genre"], N_GENRES)
+    offline = History.from_events(base, items, N_USERS, N_GENRES + 1, 1)
+    np.testing.assert_allclose(rec.history.genre_profile, offline.genre_profile, atol=1e-6)
+    np.testing.assert_array_equal(rec.history.activity, offline.activity)
+
+
+def test_api_listen_auth_and_status_codes(music_run, monkeypatch):
+    monkeypatch.setenv("ARTIFACT_DIR", str(music_run["export"]))
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("INGEST_API_KEY", raising=False)
+    ts = _recent_ts(music_run)
+    body = {"event_id": "api-1", "track_id": _track_id(4), "timestamp": ts}
+    with TestClient(api_module.app) as client:
+        trained = int(np.flatnonzero(Recommender.load(music_run["export"]).trained_users)[0])
+        uid = USER_OFFSET + trained
+        path = f"/users/{uid}/listens"
+        assert client.post(path, json=body).status_code == 503          # ingestion disabled
+        monkeypatch.setenv("INGEST_API_KEY", "ingest-key")
+    with TestClient(api_module.app) as client:
+        assert client.post(path, json=body).status_code == 401
+        auth = {"Authorization": "Bearer ingest-key"}
+        assert client.post(path, json=body, headers={"Authorization": "Bearer wrong"}).status_code == 403
+        first = client.post(path, json=body, headers=auth)
+        assert first.status_code == 202 and first.json()["status"] == "accepted"
+        assert "user_id" in first.json() and str(uid) not in first.text
+        again = client.post(path, json=body, headers=auth)
+        assert again.status_code == 200 and again.json()["status"] == "duplicate"
+        bad_track = client.post(path, json={**body, "event_id": "api-2", "track_id": "nope"}, headers=auth)
+        assert bad_track.status_code == 422
+        bad_id = client.post(path, json={**body, "event_id": "has space"}, headers=auth)
+        assert bad_id.status_code == 422
+        unknown = client.post("/users/424242/listens", json={**body, "event_id": "api-3"}, headers=auth)
+        assert unknown.status_code == 404
+
+
+def test_prometheus_metrics_fixed_labels_and_cumulative_buckets(music_run, monkeypatch):
+    monkeypatch.setenv("ARTIFACT_DIR", str(music_run["export"]))
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.setenv("INGEST_API_KEY", "ingest-key")
+    uid = USER_OFFSET + int(np.flatnonzero(Recommender.load(music_run["export"]).trained_users)[0])
+    with TestClient(api_module.app) as client:
+        client.get(f"/recommendations/{uid}", params={"k": 3})
+        client.post(f"/users/{uid}/listens", json={"event_id": "m1", "track_id": _track_id(2),
+                                                   "timestamp": _recent_ts(music_run)},
+                    headers={"Authorization": "Bearer ingest-key"})
+        resp = client.get("/metrics")
+        assert resp.status_code == 200 and resp.headers["content-type"].startswith("text/plain")
+        text = resp.text
+    assert 'rtrec_recommendation_requests_total{source="personalized"} 1' in text
+    assert 'rtrec_listen_events_total{outcome="accepted"} 1' in text
+    assert "rtrec_model_loaded 1" in text
+    assert str(uid) not in text and "TRK" not in text          # no user or track identifiers
+    buckets = [int(line.rsplit(" ", 1)[1]) for line in text.splitlines()
+               if line.startswith("rtrec_request_duration_seconds_bucket")]
+    assert buckets == sorted(buckets) and buckets[-1] == 1
+
+
+def test_forget_restores_artifact_features(music_run):
+    rec = Recommender.load(music_run["export"])
+    pos = int(np.flatnonzero(rec.trained_users)[0])
+    before = (rec.history.genre_profile[pos].copy(), rec.history.activity[pos], rec.history.item_popularity.copy(),
+              sorted(rec.history.seen(pos).tolist()))
+    for n, item in enumerate([3, 5, 8]):
+        _listen(rec, pos, item, f"forget-{n}", _recent_ts(music_run))
+    assert rec.forget_listens(str(int(rec.user_ids[pos]))) == 3
+    after = (rec.history.genre_profile[pos], rec.history.activity[pos], rec.history.item_popularity,
+             sorted(rec.history.seen(pos).tolist()))
+    np.testing.assert_allclose(after[0], before[0], atol=1e-6)
+    assert after[1] == before[1]
+    np.testing.assert_array_equal(after[2], before[2])
+    assert after[3] == before[3]
+    # the same event id can be applied again after deletion
+    assert _listen(rec, pos, 3, "forget-0", _recent_ts(music_run)) == "accepted"

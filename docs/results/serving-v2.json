@@ -1,0 +1,138 @@
+{
+  "artifacts": "Music4All-Onion 10k-user model (artifacts-music4all-10k, not committed)",
+  "stack": "docker-compose: two API containers, nginx (user-affinity routing), Redis",
+  "environment": "12-core Apple Silicon Mac; Colima VM 4 vCPU / 6 GB; load clients on the same host (localhost)",
+  "clients": "4 processes, 16 concurrent requests, 300 warm-up requests excluded, 7,700 measured per run",
+  "compose_runs": [
+    {
+      "scenario": "cache_high",
+      "label": "cache-high (300-user pool), 2 instances",
+      "user_pool": 300,
+      "requests": 7700,
+      "errors": 0,
+      "throughput_rps": 2847.3,
+      "latency_ms": {
+        "mean": 5.07,
+        "p50": 4.7,
+        "p95": 9.47,
+        "p99": 11.83
+      },
+      "observed_cache_hit_rate": 1.0,
+      "events": [],
+      "docker_stats_after": [
+        "rtrec-lb-1 11.24MiB / 5.772GiB 0.00%",
+        "rtrec-api1 251.5MiB / 5.772GiB 0.28%",
+        "rtrec-api2 252.7MiB / 5.772GiB 0.33%",
+        "rtrec-redis-1 4.121MiB / 5.772GiB 0.70%"
+      ]
+    },
+    {
+      "scenario": "cache_mid",
+      "label": "cache-mid (3000-user pool), 2 instances",
+      "user_pool": 3000,
+      "requests": 7700,
+      "errors": 0,
+      "throughput_rps": 2054.3,
+      "latency_ms": {
+        "mean": 6.87,
+        "p50": 6.13,
+        "p95": 13.71,
+        "p99": 19.42
+      },
+      "observed_cache_hit_rate": 0.676,
+      "events": [],
+      "docker_stats_after": [
+        "rtrec-lb-1 11.23MiB / 5.772GiB 0.00%",
+        "rtrec-api1 256.5MiB / 5.772GiB 0.15%",
+        "rtrec-api2 256.8MiB / 5.772GiB 0.15%",
+        "rtrec-redis-1 6.062MiB / 5.772GiB 0.37%"
+      ]
+    },
+    {
+      "scenario": "uncached_2",
+      "label": "uncached (Redis down), 2 instances",
+      "user_pool": 3000,
+      "requests": 7700,
+      "errors": 0,
+      "throughput_rps": 1367.6,
+      "latency_ms": {
+        "mean": 10.53,
+        "p50": 10.04,
+        "p95": 18.93,
+        "p99": 23.19
+      },
+      "observed_cache_hit_rate": 0.0,
+      "events": [],
+      "docker_stats_after": [
+        "rtrec-lb-1 11.24MiB / 5.772GiB 0.00%",
+        "rtrec-api1 258.2MiB / 5.772GiB 0.22%",
+        "rtrec-api2 258.6MiB / 5.772GiB 0.28%"
+      ]
+    },
+    {
+      "scenario": "uncached_failure",
+      "label": "uncached (Redis down), instance api2 SIGKILLed at 3 s",
+      "user_pool": 3000,
+      "requests": 7700,
+      "errors": 0,
+      "throughput_rps": 1216.7,
+      "latency_ms": {
+        "mean": 12.03,
+        "p50": 11.72,
+        "p95": 20.85,
+        "p99": 25.42
+      },
+      "observed_cache_hit_rate": 0.0,
+      "events": [
+        {
+          "t": 3.0,
+          "event": "killed rtrec-api2"
+        }
+      ],
+      "docker_stats_after": [
+        "rtrec-lb-1 11.18MiB / 5.772GiB 0.00%",
+        "rtrec-api1 258.7MiB / 5.772GiB 0.31%"
+      ]
+    },
+    {
+      "scenario": "cache_failure",
+      "label": "cache-mid (3000-user pool), instance api2 SIGKILLed at 3 s",
+      "user_pool": 3000,
+      "requests": 7700,
+      "errors": 0,
+      "throughput_rps": 1798.8,
+      "latency_ms": {
+        "mean": 7.91,
+        "p50": 7.55,
+        "p95": 15.14,
+        "p99": 20.63
+      },
+      "observed_cache_hit_rate": 0.614,
+      "events": [
+        {
+          "t": 3.0,
+          "event": "killed rtrec-api2"
+        }
+      ],
+      "docker_stats_after": [
+        "rtrec-lb-1 11.18MiB / 5.772GiB 0.00%",
+        "rtrec-api1 258.6MiB / 5.772GiB 0.20%",
+        "rtrec-redis-1 5.898MiB / 5.772GiB 0.65%"
+      ]
+    }
+  ],
+  "listen_ingestion": {
+    "events": 4000,
+    "concurrency": 8,
+    "status_counts": {
+      "202": 4000
+    },
+    "throughput_eps": 1026.2,
+    "latency_ms": {
+      "mean": 7.49,
+      "p50": 6.25,
+      "p95": 14.12,
+      "p99": 20.35
+    }
+  }
+}

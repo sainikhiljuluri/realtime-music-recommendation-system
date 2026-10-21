@@ -73,7 +73,8 @@ def test_api_survives_redis_outage(artifacts, monkeypatch):
         resp = client.get("/recommendations/u2", params={"k": 3})
         assert resp.status_code == 200
         assert len(resp.json()["items"]) == 3
-        assert client.get("/ready").json()["cache_errors"] >= 2
+        # The generation read fails first, so the request skips the cache. The error is counted.
+        assert client.get("/ready").json()["cache_errors"] >= 1
 
 
 def test_delete_purges_user_cache_entries(artifacts, monkeypatch):

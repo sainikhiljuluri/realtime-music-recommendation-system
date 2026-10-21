@@ -52,6 +52,25 @@ Nothing from a later window reaches an earlier model or feature set. Only the va
 
 **Run cost** (macOS, 12 cores, single-threaded PyTorch, LightGBM, and FAISS): building the sample streams the 2.2 GB log twice and took 398 s with a peak of 3.5 GB. The experiment itself took 249 s with a peak of 4.8 GB.
 
+### Independent 50,000-user run (seed 1)
+
+A second sample: 50,000 users drawn with seed 1 (same stratification and filters), and the same configuration with seed 1 for the model. Nothing was tuned on the earlier test window, and the 10,000-user results above are unchanged. Raw metrics: `docs/results/music4all-50k-seed1.json`.
+
+Sample: 74.7M stage-1 events, 18.7M ranker-window, 12.4M validation, 18.7M test. Test pool: 11,335 users. Ranker trained on 10,000 users (1.5M rows). Selected on validation: λ = 0.
+
+| Model (test window) | Recall@10 | Recall@20 | NDCG@10 | Genre diversity@10 | Coverage@10 |
+|---|---|---|---|---|---|
+| Popularity | 0.0016 [0.0015, 0.0019] | 0.0028 | 0.0549 | 0.838 | 0.002 |
+| SVD CF | 0.0018 [0.0016, 0.0019] | 0.0032 | 0.0643 | 0.594 | 0.031 |
+| Two-tower + FAISS only | 0.0013 [0.0012, 0.0015] | 0.0026 | 0.0417 | 0.457 | 0.703 |
+| Hybrid + LightGBM, λ = 0 (selected) | 0.0026 [0.0024, 0.0029] | 0.0044 | 0.0846 | 0.603 | 0.291 |
+| Hybrid, λ = 0.1 | 0.0027 [0.0024, 0.0030] | 0.0044 | 0.0849 | 0.756 | 0.275 |
+| Hybrid, λ = 0.4 | 0.0026 [0.0024, 0.0029] | 0.0043 | 0.0833 | 0.933 | 0.273 |
+
+Paired differences in Recall@20 (hybrid λ=0 minus X), 95% bootstrap intervals: popularity +0.0017 [0.0013, 0.0020]; SVD CF +0.0013 [0.0009, 0.0016]; retrieval only +0.0018 [0.0015, 0.0022].
+
+What this run supports: the hybrid ranker beats the popularity, SVD, and retrieval-only baselines on this sample, and the intervals don't overlap with popularity or with SVD. What it does not show: the λ grid (0, 0.1, 0.2, 0.4) differs by less than the intervals on recall and NDCG, so the choice of λ is a tie on accuracy, and diversity is the real trade-off. The 10,000-user and 50,000-user results used different samples, so compare them only as independent replications, not as one pooled estimate. Hardware: 8.8 GB peak RSS, 1,378 s total on the 12-core Mac. The model is still trained for two epochs, and I did not tune it.
+
 ## MovieLens 25M: scalability benchmark
 
 This is a separate benchmark for scale. It is not a music-personalization result. The dataset is 12.45M positive ratings from 161,821 users over 40,858 movies, with each user's last event held out for testing (one positive per user, K = 10).
@@ -73,54 +92,48 @@ With 2,000 synthetic users and 15 epochs, the hybrid ranker reaches Recall@10 of
 
 ## Serving the Music4All model
 
-The API serves the Music4All model. The same candidate, ranking, and diversity functions run offline (during evaluation) and online (in the API), so a served list is the list the experiment evaluated.
+The API serves the Music4All model. Candidate generation, LightGBM scoring, and diversity selection run through `hybrid.py` in both the offline evaluation and the API, so the served lists are the lists the experiment evaluated.
 
-**Artifacts.** `python scripts/run_music.py --export artifacts-music4all-10k` writes the two-tower weights, FAISS index, LightGBM ranker, user and track vectors, the history at the test cut-off, Music4All user and track ids, and a `config.json` with `"model_family": "music4all"` and the diversity penalty chosen on validation (`selected_lambda`). The directory is not committed. The API reports which family it loaded at `GET /ready`.
+**What updates online, and what does not.** Listen events change the features the ranker reads: the user's genre profile and activity, the seen set, and item popularity. Frozen until retraining: the two-tower user and track vectors (so FAISS candidates still come from the artifact snapshot), the popularity order used for candidate generation and cold start, and the LightGBM weights. A new listen therefore changes the ranking immediately, but it does not change which tracks are retrieved. A new user needs a retrain.
 
-**Ids and unknown cases.** Requests use Music4All user ids. Responses return Music4All track ids, for example `PFYen7nm8cFFUub4`. A user id that is unknown, non-numeric, or has no trained vector gets the catalog popularity list, labeled `source: cold_start`. A user who has already played a track is never recommended it.
+**Listen ingestion.** `POST /users/{user_id}/listens` with `{"event_id", "track_id", "timestamp"}` and a bearer token (`INGEST_API_KEY`).
 
-**Readiness.** Loading runs a self-check: one cold-start request and one personalized request, uncached. `/ready` returns 503 with a reason (for example `FileNotFoundError`) if any artifact is missing or inconsistent, and `/health` stays 200. `GET /metrics` returns request counts by source, cache hit rate, and p50/p95/p99 latency over the last 5,000 requests. It contains no user ids and covers one process only.
-
-**OpenMP.** Serving calls LightGBM with `num_threads=1`. faiss and LightGBM loaded together crashed (exit 139) in 5 of 5 runs with four LightGBM threads, with or without the workaround flag. With one thread, there were no failures. See `docs/FAILURES.md`.
-
-### Measured serving performance (localhost)
-
-Hardware: a 12-core Apple Silicon Mac. Docker runs under Colima (4 vCPU, 6 GB). The load generator runs on the same machine, so these numbers are localhost measurements, not networked ones. Each run sends 8,000 requests from 4 client processes with 16 concurrent requests. Source: `docs/results/serving-music4all.json`.
-
-| Setup | Throughput (req/s) | p50 (ms) | p95 (ms) | p99 (ms) | Memory (MB) |
-|---|---|---|---|---|---|
-| 1 uvicorn worker, no cache | 2,057 | 6.96 | 10.72 | 12.62 | 313 |
-| 2 workers, no cache | 3,067 | 4.50 | 7.13 | 8.63 | 669 |
-| 4 workers, no cache | 3,362 | 4.22 | 6.14 | 7.45 | 1,290 |
-| 1 worker, Redis cache (61% hits) | 2,283 | 5.62 | 10.76 | 13.35 | 314 |
-| 2 workers, Redis cache | 3,335 | 3.40 | 7.61 | 9.53 | 670 |
-| 4 workers, Redis cache | 3,292 | 3.35 | 8.38 | 10.38 | 1,286 |
-
-Memory is the total RSS of the server process tree. Each worker loads its own copy of the model, so memory grows with worker count. At four workers, throughput barely rose above two, and the shared client machine is the likely limit. I did not measure that separately. The Redis cache gave a small gain here, because the workload draws from 3,000 users and the hit rate is 61%.
-
-### Two instances behind a load balancer
-
-`docker-compose up --build -d` starts two API containers, Redis, and an nginx load balancer on `localhost:8080`. Each API container has a readiness health check, and nginx retries a failed request on the other instance.
-
-| Test | Result |
+| Input | Result |
 |---|---|
-| Steady load through nginx, 7,700 measured requests | 2,174 req/s, p50 5.65 ms, p95 12.8 ms, p99 17.5 ms, 0 errors |
-| Memory | about 212 MiB per API container (one worker each) |
-| Failover under load: `docker kill` one instance at t=6 s, restart it at t=12 s, then stop the other gracefully at t=19 s | 30,000 requests, 0 client-visible errors. Nginx retries were not logged, so the number of retries is unknown. |
-| Graceful stop under load (`docker-compose stop -t 25`) | exit code 0 in about 1 s; uvicorn logged "Application shutdown complete" |
+| New valid event | 202, features updated, the user's cache entries invalidated |
+| Repeated `event_id` for the same user | 200 `duplicate`, no state change (idempotent) |
+| Unknown or untrained user | 404 |
+| Unknown track | 422 |
+| Timestamp before the history cutoff | 422 |
+| Timestamp more than 5 minutes in the future | 422 |
+| Malformed `event_id` | 422 (validation) |
+| Missing or wrong token | 401 or 403; 503 when `INGEST_API_KEY` is unset |
 
-The Compose run went through the VM network and shared 4 vCPUs between nginx, two APIs, and Redis. It is slower than the multi-process localhost run and is not a production benchmark. I have not run the stack on separate hosts, so cross-host latency and throughput are unmeasured.
+**Cache invalidation.** Cache keys contain a per-user generation counter kept in Redis. A listen increments it, so every instance stops reading that user's old entries at once. The admin `DELETE` removes cached entries and also reverses that user's listen updates in memory.
 
-### Earlier benchmark (MovieLens artifacts)
+**User affinity.** Nginx routes `/recommendations/{id}`, `/users/{id}/listens`, and `/users/{id}/recommendations` to one instance by user id (consistent hashing). A user's listen features live in that instance's memory, so the events and the recommendations for that user must reach the same process. If an instance dies, its users move to the other instance, which doesn't have their recent listens. Those listens are lost until a shared store exists. See Limitations.
 
-These numbers are from the MovieLens model (1,514 MB for 4 workers). They are not music results. Redis lowered throughput there because the hit rate was 2.3%, against 162,000 users. The cold-start path once re-sorted every item per request (0.912 ms). It now uses a popularity order computed at startup (0.002 ms).
+**Readiness and metrics.** Loading runs a self-check (one cold-start and one personalized request, uncached). `/ready` returns 503 with a reason if loading fails. `GET /metrics` is Prometheus text: request counts by source, cache lookups, listen outcomes, HTTP errors by status, a latency histogram, and model state. Labels are fixed sets, so the series count does not grow with users or tracks. `GET /stats` returns the same numbers as JSON, with p50/p95/p99 latency over the last 5,000 requests.
 
-| Configuration | Throughput (req/s) | p50 (ms) | p95 (ms) | p99 (ms) | Memory (MB) |
-|---|---|---|---|---|---|
-| 1 worker | 2,589 | 5.44 | 7.79 | 9.28 | 368 |
-| 2 workers | 3,184 | 3.97 | 6.33 | 7.22 | 776 |
-| 4 workers | 3,890 | 3.57 | 5.05 | 6.20 | 1,514 |
-| 4 workers + Redis (flushed) | 3,250 | 4.30 | 6.27 | 7.50 | 1,511 |
+### Measured serving performance
+
+Hardware: a 12-core Apple Silicon Mac, with Docker under Colima (4 vCPU, 6 GB). Load clients run on the same host, so these are localhost measurements, not networked ones. Each run sends 7,700 measured requests after 300 warm-up requests, from 4 client processes with 16 concurrent requests. Raw results: `docs/results/serving-v2.json`.
+
+The cache hit ratio depends on the user pool and the TTL, so I measured three pool sizes and report the ratio each run observed.
+
+| Scenario (two instances, nginx, Redis) | Observed hit ratio | Throughput (req/s) | p50 (ms) | p95 (ms) | p99 (ms) | Errors |
+|---|---|---|---|---|---|---|
+| 300-user pool, cached | 100% | 2,847 | 4.70 | 9.47 | 11.83 | 0 |
+| 3,000-user pool, cached | 68% | 2,054 | 6.13 | 13.71 | 19.42 | 0 |
+| 3,000-user pool, Redis down (uncached inference) | 0% | 1,368 | 10.04 | 18.93 | 23.19 | 0 |
+| Redis down, one instance SIGKILLed at 3 s | 0% | 1,217 | 11.72 | 20.85 | 25.42 | 0 |
+| 3,000-user pool, cached, one instance SIGKILLed at 3 s | 61% | 1,799 | 7.55 | 15.14 | 20.63 | 0 |
+
+The failure rows show zero client errors when an instance is SIGKILLed. After the kill, requests are served by the remaining instance, so throughput falls to roughly one instance's share. Requests in flight at the kill were retried by nginx or failed over; the retry count is not logged. Memory per API container was about 250 MiB under this load.
+
+**Listen ingestion** (`scripts/bench_ingest.py`, 4,000 events, 8 concurrent, through nginx): 1,026 events/s, p50 6.3 ms, p95 14.1 ms, p99 20.4 ms, all 202.
+
+**Earlier worker benchmark (before online features, MovieLens and Music4All, localhost).** On the Music4All artifacts, one uvicorn process per worker count: 1 worker 2,057 req/s (p99 12.6 ms, 313 MB), 2 workers 3,067 req/s (p99 8.6 ms, 669 MB), 4 workers 3,362 req/s (p99 7.5 ms, 1,290 MB), uncached. The cache path adds one Redis read per request now, so these numbers are not directly comparable with the table above. Raw data for that worker run is in `docs/results/serving-music4all.json`, and the earlier MovieLens worker table is in `docs/results/serving-benchmark.json`.
 
 ## Running it
 
@@ -130,7 +143,7 @@ Requires Python 3.11 or newer.
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 ruff check src scripts tests
-pytest -q                                                  # 78 tests
+pytest -q                                                  # 90 tests
 
 # Music4All-Onion: download the Zenodo record 15394646 files
 #   userid_trackid_timestamp.tsv.bz2 and id_genres_tf-idf.tsv.bz2 into <music4all dir>
@@ -144,11 +157,18 @@ curl "localhost:8000/recommendations/<music4all user id>?k=10"
 
 # Two instances behind nginx, with Redis (needs Docker; compose v2 or docker-compose)
 cp .env.example .env                                       # set PSEUDONYM_KEY and ADMIN_API_KEY
+scripts/seed_artifacts.sh artifacts-music4all-10k                # copy artifacts into the named volume
 docker-compose up --build -d                               # http://localhost:8080
+
+# Listen ingestion (needs INGEST_API_KEY; the stack reads it from .env)
+curl -X POST -H "Authorization: Bearer $INGEST_API_KEY" -H "content-type: application/json" \
+  -d '{"event_id":"e-1","track_id":"<track id>","timestamp":1760000000}' localhost:8080/users/<user id>/listens
 
 # Load and worker benchmarks (localhost)
 python scripts/sample_user_ids.py --artifacts artifacts-music4all-10k --out user_ids.txt
 python scripts/bench_workers.py --artifacts artifacts-music4all-10k --user-ids-file user_ids.txt --workers 1,2,4
+python scripts/bench_compose.py --users-file user_ids.txt --requests 8000 --kill rtrec-api2 --kill-after 3
+python scripts/bench_ingest.py --users-file user_ids.txt --track <track id> --events 4000
 
 # Synthetic and MovieLens benchmarks
 python -m rtrec.pipeline --out artifacts --epochs 15
@@ -169,12 +189,14 @@ offline (scripts/run_music.py)
   export        ─► artifacts-music4all-10k/  (weights, index, ranker, vectors, history, ids, config)
 
 online (FastAPI, one process per container)
-  GET /recommendations/{user_id}   Redis cache ─► known user? ─► hybrid candidates ─► LightGBM ─► diversity rerank ─► top-k
-                                                              └─ unknown / untrained ─► catalog popularity (cold_start)
+  GET /recommendations/{user_id}   generation-keyed Redis cache ─► known user? ─► hybrid candidates (seen overlay)
+                                   ─► LightGBM (online genre profile, activity, popularity) ─► diversity rerank ─► top-k
+                                   └─ unknown / untrained ─► catalog popularity (cold_start)
+  POST /users/{user_id}/listens    validate ─► idempotent update of in-memory features ─► bump user generation
   GET /health                      liveness
   GET /ready                       readiness: model loaded and self-checked
-  GET /metrics                     counters and latency percentiles (no user ids)
-  DELETE /users/{id}/recommendations   bearer token (ADMIN_API_KEY) required
+  GET /metrics                     Prometheus text (fixed labels, no user or track ids); /stats is JSON
+  DELETE /users/{user_id}/recommendations   bearer token (ADMIN_API_KEY): cache purge and listen reversal
 
 deployment (docker-compose.yml)
   nginx :8080 ─► api1, api2 (read-only artifacts volume, PSEUDONYM_KEY from .env) ─► redis
@@ -197,7 +219,9 @@ deployment (docker-compose.yml)
 
 ## Security and privacy
 
-- **Deletion requires authentication.** `DELETE /users/{id}/recommendations` needs a bearer token equal to `ADMIN_API_KEY`. Tests cover a missing token (401), a wrong token (403), a correct token (200), and a disabled endpoint (503). Self-service deletion by users is not implemented.
+- **Deletion requires authentication.** `DELETE /users/{id}/recommendations` needs a bearer token equal to `ADMIN_API_KEY`. Tests cover a missing token (401), a wrong token (403), a correct token (200), and a disabled endpoint (503). The same call reverses that user's listen updates in memory. Self-service deletion by users is not implemented.
+- **Listen ingestion requires a separate token** (`INGEST_API_KEY`), which the event producer holds. It does not grant deletion.
+- **Metrics contain no user or track ids.** Prometheus labels are fixed sets: source, cache result, outcome, and status.
 - **Logs contain no raw user ids.** They carry an HMAC pseudonym, and a test checks this. Every instance in the Compose stack must share one `PSEUDONYM_KEY`. Otherwise the same user gets different pseudonyms on different instances.
 - **Metrics contain no user ids.** `GET /metrics` returns counts and latencies only.
 - **Deletion has limits.** Purging clears cached recommendations. It does not remove a user's data from training artifacts, which needs retraining. See `docs/PRIVACY.md`.
@@ -208,29 +232,32 @@ deployment (docker-compose.yml)
 - **Import order.** PyTorch is imported before FAISS.
 - **Same code offline and online.** Candidate generation, LightGBM scoring, and diversity selection run through `hybrid.py` in both the evaluation and the API. The tests check that the API returns the list the shared functions produce from the saved artifacts.
 - **Chronological splits, not random ones.** Random splits would let the model see the future.
-- **Container image.** Artifacts are mounted read-only, not baked into the image. The container runs as a non-root user. LightGBM needs `libgomp1`, which the slim base image lacks. The first build passed and the container then failed at import, so the build alone does not show a container starts.
+- **Container image.** Artifacts are read-only, from a named volume, not baked into the image. Host bind mounts failed under Colima's virtiofs (see `docs/FAILURES.md`), so `scripts/seed_artifacts.sh` copies the artifacts into the volume. The container runs as a non-root user. LightGBM needs `libgomp1`, which the slim base image lacks. The first build passed and the container then failed at import, so the build alone does not show a container starts.
 
 ## Limitations
 
 - **Offline only.** There are no online experiments, and no real-user outcomes.
 - **One sample, one seed.** Music results come from one 10,000-user sample and one seed. Variance across seeds and samples is not measured.
-- **Frozen user vectors.** Served user vectors come from the stage-1 model. Ranking features and the seen set use the history up to the test cut-off. Nothing updates while the service runs, and new listening needs a retrain.
+- **Frozen user vectors.** Served user vectors come from the stage-1 model. Listen events update the ranker's features (genre profile, activity, seen set, popularity), but they do not update the two-tower vectors, so retrieval candidates are fixed until retraining.
+- **Online state is per instance and in memory.** A user's listens are held by the instance that serves that user (affinity routing). A restart or a failover loses them, and the users moved to the other instance see the artifact features until they listen again. The fix is a shared store, which I have not built. Listen events are not persisted anywhere, so the event log is also lost.
+- **Dedupe memory grows.** The set of applied `event_id`s per user is kept for the life of the process. It is not bounded or evicted.
+- **Redis is one instance.** A cache outage makes every request uncached (measured above). The generation counter is read once per request, which costs one Redis round trip on the hot path.
 - **Two untrained users.** Two of the 10,000 sampled users have no events before the stage-1 cut-off. The API serves them as cold start. One of them has events before the test cut-off, so the reported test pool included that user with an untrained vector. That is one of 2,300 test users. I did not change the reported results.
 - **Ranker data.** The ranker is trained on 4,159 users. Cold-start test users are almost absent (one).
 - **Model.** Two epochs, not tuned. No artist features (excluded by decision). No sequential modeling.
 - **Localhost benchmarks only.** The client and server shared one machine. No networked, cross-host, or multi-region measurements exist.
 - **Failover is not fault-tolerant at the database level.** Redis is a single instance. If it goes down, requests are served without cache, and the API keeps working.
-- **Not done:** Prometheus export (metrics are JSON), distributed tracing, multi-region deployment, automatic model rollout or rollback, and self-service per-user deletion.
+- **Not done:** distributed tracing, multi-region deployment, automatic model rollout or rollback, self-service per-user deletion, a shared online-feature store, and durable listen logging.
 
 ## Project layout
 
 ```
 src/rtrec/                  library
-tests/                      78 tests (data, model, retrieval, ranking, cache, service, API,
+tests/                      90 tests (data, model, retrieval, ranking, cache, service, API,
                             security, privacy, experiments, evaluation, metrics, MovieLens,
                             music loader and pipeline, music serving end-to-end)
 scripts/                    build_music_sample.py, run_music.py, sample_user_ids.py,
-                            loadtest.py, bench_workers.py, openmp_probe.py
+                            loadtest.py, bench_workers.py, bench_compose.py, bench_ingest.py, openmp_probe.py
 deploy/nginx.conf           load balancer for the two-instance stack
 Dockerfile, docker-compose.yml, .env.example
 .github/workflows/ci.yml    lint, tests, container smoke test

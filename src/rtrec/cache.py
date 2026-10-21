@@ -26,6 +26,12 @@ class NullCache:
     def delete_matching(self, pattern: str) -> int:
         return 0
 
+    def generation(self, user: str) -> int | None:
+        return 0
+
+    def bump_generation(self, user: str) -> bool:
+        return True
+
 
 class RedisCache:
     available = True
@@ -70,6 +76,26 @@ class RedisCache:
         except redis.RedisError as exc:
             self.errors += 1
             log.warning("cache set failed: %s", exc)
+
+    def generation(self, user: str) -> int | None:
+        """Per-user generation. Cache keys include it, so bumping it invalidates that user's entries
+        on every instance at once. Returns None when Redis is unavailable (caller skips the cache)."""
+        try:
+            raw = self.client.get(f"gen:{user}")
+        except redis.RedisError as exc:
+            self.errors += 1
+            log.warning("generation read failed: %s", exc)
+            return None
+        return int(raw) if raw is not None else 0
+
+    def bump_generation(self, user: str) -> bool:
+        try:
+            self.client.incr(f"gen:{user}")
+            return True
+        except redis.RedisError as exc:
+            self.errors += 1
+            log.warning("generation bump failed: %s", exc)
+            return False
 
     def delete_matching(self, pattern: str) -> int:
         try:

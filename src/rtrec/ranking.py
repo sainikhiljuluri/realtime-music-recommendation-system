@@ -1,7 +1,7 @@
 """History features and LightGBM ranking over FAISS candidates."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import lightgbm as lgb
 import numpy as np
@@ -31,6 +31,8 @@ class History:
     activity: np.ndarray          # (n_users,) float32, event counts
     seen_indptr: np.ndarray       # CSR row pointers over users into seen_indices
     seen_indices: np.ndarray      # item indices each user has already listened to
+    # Online overlay: items a user played after the artifact was built. Empty for offline use.
+    extra_seen: dict = field(default_factory=dict, repr=False)
 
     @classmethod
     def from_events(cls, events: pd.DataFrame, items: pd.DataFrame, n_users: int, n_genres: int, n_artists: int) -> "History":
@@ -59,7 +61,11 @@ class History:
                    indptr, pairs["i"].to_numpy(dtype=np.int64))
 
     def seen(self, user: int) -> np.ndarray:
-        return self.seen_indices[self.seen_indptr[user]:self.seen_indptr[user + 1]]
+        base = self.seen_indices[self.seen_indptr[user]:self.seen_indptr[user + 1]]
+        extra = self.extra_seen.get(user)
+        if not extra:
+            return base
+        return np.union1d(base, np.fromiter(extra, dtype=np.int64, count=len(extra)))
 
     def max_seen(self) -> int:
         return int(np.diff(self.seen_indptr).max()) if self.seen_indptr.size > 1 else 0
