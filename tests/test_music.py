@@ -4,10 +4,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from rtrec import music
 from rtrec.evaluation import diversity_rerank, novelty, self_information
 from rtrec.metrics import ndcg_at_k_set, recall_at_k_set
-from rtrec.music import MusicSample, load_sample, stratified_user_sample
+from rtrec.music import load_sample, stratified_user_sample
 from rtrec.music_pipeline import MusicConfig, run
 
 

@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install (CPU PyTorch, project, dev tools)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev]"
+      - name: Lint
+        run: ruff check src scripts tests
+      - name: Test
+        run: pytest -q
+
+  docker:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build image
+        run: docker build -t rtrec-api:ci .
+      - name: Train synthetic artifacts (no dataset needed)
+        run: |
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu -e .
+          python -m rtrec.pipeline --out artifacts > /dev/null
+      - name: Start container and wait for readiness
+        run: |
+          docker run -d --name rtrec-ci -p 8000:8000 \
+            -e PSEUDONYM_KEY=ci-key \
+            -v "$PWD/artifacts:/app/artifacts:ro" rtrec-api:ci
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /tmp/ready.json -w "%{http_code}" http://127.0.0.1:8000/ready || true)
+            if [ "$code" = "200" ]; then cat /tmp/ready.json; echo; exit 0; fi
+            sleep 2
+          done
+          docker logs rtrec-ci
+          exit 1
+      - name: Smoke test recommendations
+        run: |
+          curl -fsS "http://127.0.0.1:8000/recommendations/u1?k=5" | python -c "import json,sys; b=json.load(sys.stdin); assert len(b['items'])==5, b; print('ok', b['source'])"
+      - name: Stop container
+        if: always()
+        run: docker rm -f rtrec-ci || true

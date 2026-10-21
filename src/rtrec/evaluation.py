@@ -51,17 +51,25 @@ def self_information(play_counts: np.ndarray) -> np.ndarray:
     return -np.log2((play_counts + 1.0) / total)
 
 
-def diversity_rerank(items: np.ndarray, scores: np.ndarray, genres: np.ndarray, k: int, lam: float) -> list[int]:
-    """Greedy reranking: pick the best score minus lam per already-selected item of the same genre."""
+def diversity_select(items: np.ndarray, scores: np.ndarray, genres: np.ndarray, k: int, lam: float) -> list[int]:
+    """Positions into `items` in rank order. Greedy: best score minus lam per already-picked item of the same genre.
+
+    `genres` is indexed by item id, so it is the full catalog's genre array.
+    """
     if lam <= 0:
-        return [int(i) for i in items[np.argsort(-scores, kind="stable")][:k]]
+        return [int(j) for j in np.argsort(-scores, kind="stable")[:k]]
     remaining = list(range(len(items)))
     picked: list[int] = []
     counts: dict[int, int] = {}
     for _ in range(min(k, len(items))):
         best = max(remaining, key=lambda j: (scores[j] - lam * counts.get(int(genres[items[j]]), 0), -j))
         remaining.remove(best)
-        picked.append(int(items[best]))
+        picked.append(best)
         g = int(genres[items[best]])
         counts[g] = counts.get(g, 0) + 1
     return picked
+
+
+def diversity_rerank(items: np.ndarray, scores: np.ndarray, genres: np.ndarray, k: int, lam: float) -> list[int]:
+    """Item ids for diversity_select."""
+    return [int(items[j]) for j in diversity_select(items, scores, genres, k, lam)]

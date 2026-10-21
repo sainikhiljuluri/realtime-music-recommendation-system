@@ -62,7 +62,8 @@ def run_clients(url: str, args: argparse.Namespace, workers: int) -> dict:
             [sys.executable, str(ROOT / "scripts" / "loadtest.py"), "--url", url,
              "--users", str(args.users), "--requests", str(per_proc_req),
              "--warmup", str(args.warmup if i == 0 else 0),
-             "--concurrency", str(per_proc_conc), "--seed", str(7 + i), "--raw-out", str(raw)],
+             "--concurrency", str(per_proc_conc), "--seed", str(7 + i), "--raw-out", str(raw)]
+            + (["--user-ids-file", args.user_ids_file] if args.user_ids_file else []),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         ))
     for child in children:
@@ -101,7 +102,8 @@ def main() -> None:
     parser.add_argument("--requests", type=int, default=4000)
     parser.add_argument("--warmup", type=int, default=300)
     parser.add_argument("--concurrency", type=int, default=16)
-    parser.add_argument("--users", type=int, required=True)
+    parser.add_argument("--users", type=int, default=0, help="synthetic u<n> ids when no id file is given")
+    parser.add_argument("--user-ids-file", default=None, help="whitespace-separated real user ids to request")
     parser.add_argument("--clients", type=int, default=4, help="load-generator processes")
     parser.add_argument("--redis-url", default=None, help="enable the Redis cache; flushed before each run")
     parser.add_argument("--out", default="bench.json")

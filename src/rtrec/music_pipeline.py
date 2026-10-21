@@ -19,19 +19,22 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import torch  # imported before faiss (see rtrec/pipeline.py)
 import faiss
 import lightgbm as lgb  # noqa: F401  (ensures lightgbm loads with the same runtime settings)
 import numpy as np
 import pandas as pd
+import torch  # imported before faiss (see rtrec/pipeline.py)
 from scipy.sparse import csr_matrix
 from sklearn.decomposition import TruncatedSVD
 
 from . import retrieval
-from .evaluation import bootstrap_ci, coverage, diversity_rerank, genre_diversity, novelty, paired_diff_ci, self_information
+from .artifacts import CATALOG_FILE, CONFIG_FILE, FAISS_FILE, HISTORY_FILE, MODEL_FILE, RANKER_FILE, VECTORS_FILE
+from .evaluation import bootstrap_ci, coverage, genre_diversity, novelty, paired_diff_ci, self_information
+from .hybrid import score_pool, select_top_k
 from .metrics import ndcg_at_k_set, recall_at_k_set
-from .pipeline import Config as _TrainCfg, encode_all, train_two_tower
-from .ranking import History, candidate_features, generate_candidates, predict, train_ranker
+from .pipeline import Config as _TrainCfg
+from .pipeline import encode_all, train_two_tower
+from .ranking import History, candidate_features, generate_candidates, train_ranker
 
 torch.set_num_threads(1)
 
@@ -75,7 +78,8 @@ def _popularity_ranked(order: np.ndarray, seen: np.ndarray, k: int) -> list[int]
 
 
 def run(sample_events: pd.DataFrame, item_ids: np.ndarray, user_ids: np.ndarray, item_genre: np.ndarray,
-        n_genres: int, cfg: MusicConfig, out_dir: Path) -> dict:
+        n_genres: int, cfg: MusicConfig, out_dir: Path, export_dir: Path | None = None) -> dict:
+    """Run the experiment. With export_dir, also write the serving artifacts (see export_artifacts)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
     # Restrict the catalog to tracks with at least one event, so coverage is not diluted by unreachable tracks.
@@ -135,9 +139,8 @@ def run(sample_events: pd.DataFrame, item_ids: np.ndarray, user_ids: np.ndarray,
         seen = hist.seen(u)
         pop = _popularity_ranked(order, seen, k_max)
         retr_items, _ = retrieval.top_unseen(index, user_vecs[u], seen, cfg.candidates)
-        items, scores, ranks = generate_candidates(index, user_vecs[u], seen, order, item_vecs,
-                                                   cfg.candidates, cfg.popular_candidates)
-        rank_scores = predict(booster, candidate_features(hist, u, items, scores, ranks))
+        items, rank_scores = score_pool(index, u, user_vecs[u], hist, order, item_vecs, booster,
+                                        cfg.candidates, cfg.popular_candidates)
         svd_scores = svd_item @ svd_user[u]
         svd_scores[seen] = -np.inf
         svd_top = [int(i) for i in np.argsort(-svd_scores, kind="stable")[:k_max]]
@@ -147,7 +150,7 @@ def run(sample_events: pd.DataFrame, item_ids: np.ndarray, user_ids: np.ndarray,
             "retrieval": [int(i) for i in retr_items[:k_max]],
         }
         for lam in cfg.lambdas:
-            out[f"hybrid_lambda_{lam:g}"] = diversity_rerank(items, rank_scores, genre_of, k_max, lam)
+            out[f"hybrid_lambda_{lam:g}"] = [item for item, _ in select_top_k(items, rank_scores, hist, k_max, lam)]
         return out
 
     def evaluate(window: pd.DataFrame, hist: History, order: np.ndarray, users_pool: np.ndarray,
@@ -174,7 +177,7 @@ def run(sample_events: pd.DataFrame, item_ids: np.ndarray, user_ids: np.ndarray,
                 "recall@20": _ci(per[name]["recall@20"], cfg.seed),
                 "ndcg@10": _ci(per[name]["ndcg@10"], cfg.seed),
                 "genre_diversity@10": float(np.mean(per[name]["genre_diversity@10"])),
-                "novelty@10": float(np.mean([novelty(l, self_info) for l in lists[name]])),
+                "novelty@10": float(np.mean([novelty(ranked, self_info) for ranked in lists[name]])),
                 "coverage@10": coverage(lists[name], n_items),
             }
         return {"users_evaluated": int(len(users)), "models": report,
@@ -208,6 +211,13 @@ def run(sample_events: pd.DataFrame, item_ids: np.ndarray, user_ids: np.ndarray,
         mean, lo, hi = paired_diff_ci(np.array(pu[a]["recall@20"]), np.array(pu[b]["recall@20"]), seed=cfg.seed)
         paired[f"recall@20_{a}_minus_{b}"] = {"mean": mean, "ci95": [lo, hi]}
 
+    if export_dir is not None:
+        selected_lam = cfg.lambdas[lam_names.index(selected)]
+        export_artifacts(export_dir, model=model, index=index, booster=booster, user_vecs=user_vecs,
+                         item_vecs=item_vecs, history=h85, user_ids=user_ids, item_ids=item_ids,
+                         trained_users=np.isin(np.arange(n_users), stage1_users), cfg=cfg,
+                         selected_lambda=selected_lam, cutoffs=(t60, t75, t85))
+
     result = {
         "config": asdict(cfg),
         "time_cutoffs_unix": {"t60": t60, "t75": t75, "t85": t85},
@@ -230,6 +240,46 @@ def run(sample_events: pd.DataFrame, item_ids: np.ndarray, user_ids: np.ndarray,
     }
     (out_dir / "music_metrics.json").write_text(json.dumps(result, indent=2))
     return result
+
+
+def export_artifacts(out: Path, *, model, index, booster, user_vecs: np.ndarray, item_vecs: np.ndarray,
+                     history: History, user_ids: np.ndarray, item_ids: np.ndarray, trained_users: np.ndarray,
+                     cfg: MusicConfig, selected_lambda: float, cutoffs: tuple[int, int, int]) -> None:
+    """Write everything the API needs to serve the evaluated configuration.
+
+    The history is the one used for the test window (events before t85), so served lists
+    reproduce the evaluated system. Users with no stage-1 events have untrained user vectors,
+    so they are flagged in trained_users and served as cold start.
+    """
+    out.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), out / MODEL_FILE)
+    faiss.write_index(index, str(out / FAISS_FILE))
+    booster.save_model(str(out / RANKER_FILE))
+    np.savez(out / VECTORS_FILE, user_vecs=user_vecs, item_vecs=item_vecs)
+    np.savez(out / HISTORY_FILE,
+             item_genre=history.item_genre, item_artist=history.item_artist,
+             item_popularity=history.item_popularity, genre_profile=history.genre_profile,
+             artist_counts=history.artist_counts, activity=history.activity,
+             seen_indptr=history.seen_indptr, seen_indices=history.seen_indices)
+    np.savez(out / CATALOG_FILE, user_ids=np.asarray(user_ids, dtype=np.int64),
+             item_ids=np.asarray(item_ids, dtype=str), trained_users=np.asarray(trained_users, dtype=bool))
+    t60, t75, t85 = cutoffs
+    serving = {
+        "model_family": "music4all",
+        "dataset": "Music4All-Onion",
+        "candidates": cfg.candidates,
+        "popular_candidates": cfg.popular_candidates,
+        "selected_lambda": float(selected_lambda),
+        "seed": cfg.seed,
+        "n_users": int(len(user_ids)),
+        "n_items": int(len(item_ids)),
+        "trained_users": int(np.asarray(trained_users).sum()),
+        "history_cutoff_unix": int(t85),
+        "stage1_cutoff_unix": int(t60),
+        "validation_cutoff_unix": int(t75),
+        "evaluation_report": "music_metrics.json",
+    }
+    (out / CONFIG_FILE).write_text(json.dumps(serving, indent=2))
 
 
 def _ci(values: list[float], seed: int) -> dict:

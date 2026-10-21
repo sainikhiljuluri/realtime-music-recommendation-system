@@ -1,0 +1,130 @@
+{
+  "artifacts": "Music4All-Onion, 10,000-user sample, 56,051 tracks (artifacts-music4all-10k, not committed)",
+  "environment": {
+    "host": "12-core Apple Silicon Mac (macOS 26.3)",
+    "docker": "Colima VM, 4 vCPU, 6 GB, linux/arm64, Docker 29.5.2",
+    "client": "Python load generator, 4 processes (workers benchmark) or 4 processes (compose), 16 concurrent requests, 300 warm-up requests not measured",
+    "requests_per_run": 8000,
+    "user_ids": "3,000 trained users, seeded sample (scripts/sample_user_ids.py)",
+    "note": "All numbers are localhost. Client and server share one machine. Not a networked deployment."
+  },
+  "localhost_uvicorn_workers_no_cache": [
+    {
+      "workers": 1,
+      "requests": 7700,
+      "errors": 0,
+      "throughput_rps": 2057.2,
+      "latency_ms": {
+        "mean": 6.94,
+        "p50": 6.96,
+        "p95": 10.72,
+        "p99": 12.62
+      },
+      "cache_hit_rate": 0.0,
+      "rss_mb_total": 313.4
+    },
+    {
+      "workers": 2,
+      "requests": 7700,
+      "errors": 0,
+      "throughput_rps": 3067.1,
+      "latency_ms": {
+        "mean": 4.62,
+        "p50": 4.5,
+        "p95": 7.13,
+        "p99": 8.63
+      },
+      "cache_hit_rate": 0.0,
+      "rss_mb_total": 668.5
+    },
+    {
+      "workers": 4,
+      "requests": 7700,
+      "errors": 0,
+      "throughput_rps": 3361.8,
+      "latency_ms": {
+        "mean": 4.28,
+        "p50": 4.22,
+        "p95": 6.14,
+        "p99": 7.45
+      },
+      "cache_hit_rate": 0.0,
+      "rss_mb_total": 1290.2
+    }
+  ],
+  "localhost_uvicorn_workers_redis_cache": [
+    {
+      "workers": 1,
+      "requests": 7700,
+      "errors": 0,
+      "throughput_rps": 2283.4,
+      "latency_ms": {
+        "mean": 6.1,
+        "p50": 5.62,
+        "p95": 10.76,
+        "p99": 13.35
+      },
+      "cache_hit_rate": 0.613,
+      "rss_mb_total": 314.2
+    },
+    {
+      "workers": 2,
+      "requests": 7700,
+      "errors": 0,
+      "throughput_rps": 3335.1,
+      "latency_ms": {
+        "mean": 3.81,
+        "p50": 3.4,
+        "p95": 7.61,
+        "p99": 9.53
+      },
+      "cache_hit_rate": 0.613,
+      "rss_mb_total": 670.0
+    },
+    {
+      "workers": 4,
+      "requests": 7700,
+      "errors": 0,
+      "throughput_rps": 3291.5,
+      "latency_ms": {
+        "mean": 3.92,
+        "p50": 3.35,
+        "p95": 8.38,
+        "p99": 10.38
+      },
+      "cache_hit_rate": 0.62,
+      "rss_mb_total": 1286.2
+    }
+  ],
+  "compose_two_instances_nginx_redis": {
+    "requests": 7700,
+    "errors": 0,
+    "throughput_rps": 2174.1,
+    "latency_ms": {
+      "mean": 6.34,
+      "p50": 5.65,
+      "p95": 12.8,
+      "p99": 17.51
+    },
+    "cache_hit_rate": 0.613,
+    "api_container_memory": "about 212 MiB each (docker stats, one uvicorn worker per container)"
+  },
+  "failover_under_load": {
+    "requests": 30000,
+    "errors": 0,
+    "throughput_rps": 1053.6,
+    "latency_ms": {
+      "mean": 7.3,
+      "p50": 6.09,
+      "p95": 13.78,
+      "p99": 22.56
+    },
+    "cache_hit_rate": 0.987,
+    "events": [
+      "t=6s docker kill api2 (exit 137)",
+      "t=12s docker start api2",
+      "t=19s docker-compose stop -t 25 api1 (exit 0, graceful)",
+      "t=23s docker start api1"
+    ]
+  }
+}

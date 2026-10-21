@@ -1,4 +1,3 @@
-import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -53,7 +52,6 @@ def test_missing_artifacts_keep_health_up_but_not_ready(monkeypatch, tmp_path):
 
 
 def test_api_survives_redis_outage(artifacts, monkeypatch):
-    import fakeredis
     import redis
 
     from rtrec import api as api_module

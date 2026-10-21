@@ -125,4 +125,6 @@ def train_ranker(features: np.ndarray, labels: np.ndarray, group_sizes: list[int
 
 
 def predict(booster: lgb.Booster, features: np.ndarray) -> np.ndarray:
-    return booster.predict(features)
+    # num_threads=1 is required. faiss and LightGBM each carry an OpenMP runtime. With more than one
+    # LightGBM thread, the API process crashed on macOS (exit 139). See scripts/openmp_probe.py.
+    return booster.predict(features, num_threads=1)

@@ -29,10 +29,13 @@ def percentile(values: list[float], p: float) -> float:
 
 async def run(args: argparse.Namespace) -> dict:
     rng = random.Random(args.seed)
+    known = Path(args.user_ids_file).read_text().split() if args.user_ids_file else None
     ids = []
     for _ in range(args.requests):
         if rng.random() < args.cold_fraction:
             ids.append(f"cold-{rng.randrange(10**9)}")
+        elif known:
+            ids.append(known[rng.randrange(len(known))])
         else:
             ids.append(f"u{rng.randrange(args.users)}")
 
@@ -70,7 +73,7 @@ async def run(args: argparse.Namespace) -> dict:
 
     ok = len(latencies)
     raw = {"_latencies": list(latencies), "_wall": wall, "_cache_hits": cache_hits}
-    return {**raw, 
+    return {**raw,
         "url": args.url,
         "concurrency": args.concurrency,
         "requests": ok + errors,
@@ -97,6 +100,7 @@ def main() -> None:
     parser.add_argument("--cold-fraction", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--raw-out", default=None, help="write raw latencies and wall time as JSON")
+    parser.add_argument("--user-ids-file", default=None, help="real user ids to request, whitespace-separated")
     args = parser.parse_args()
     report = asyncio.run(run(args))
     if args.raw_out:

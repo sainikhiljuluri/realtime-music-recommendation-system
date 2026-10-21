@@ -71,50 +71,56 @@ Training took 305 s for two epochs, and the full run took 403 s with a peak of 4
 
 With 2,000 synthetic users and 15 epochs, the hybrid ranker reaches Recall@10 of 0.114 [0.100, 0.128], against 0.015 for popularity and 0.053 for retrieval only. The synthetic data is generated from the model's own assumptions, so this only checks that the pipeline works.
 
-## Serving: local measurements
+## Serving the Music4All model
 
-12-core Mac, Python load clients (four processes, 16 concurrent requests), MovieLens artifacts, 7,600 measured requests per run, no errors in any run. These are not music results.
+The API serves the Music4All model. The same candidate, ranking, and diversity functions run offline (during evaluation) and online (in the API), so a served list is the list the experiment evaluated.
+
+**Artifacts.** `python scripts/run_music.py --export artifacts-music4all-10k` writes the two-tower weights, FAISS index, LightGBM ranker, user and track vectors, the history at the test cut-off, Music4All user and track ids, and a `config.json` with `"model_family": "music4all"` and the diversity penalty chosen on validation (`selected_lambda`). The directory is not committed. The API reports which family it loaded at `GET /ready`.
+
+**Ids and unknown cases.** Requests use Music4All user ids. Responses return Music4All track ids, for example `PFYen7nm8cFFUub4`. A user id that is unknown, non-numeric, or has no trained vector gets the catalog popularity list, labeled `source: cold_start`. A user who has already played a track is never recommended it.
+
+**Readiness.** Loading runs a self-check: one cold-start request and one personalized request, uncached. `/ready` returns 503 with a reason (for example `FileNotFoundError`) if any artifact is missing or inconsistent, and `/health` stays 200. `GET /metrics` returns request counts by source, cache hit rate, and p50/p95/p99 latency over the last 5,000 requests. It contains no user ids and covers one process only.
+
+**OpenMP.** Serving calls LightGBM with `num_threads=1`. faiss and LightGBM loaded together crashed (exit 139) in 5 of 5 runs with four LightGBM threads, with or without the workaround flag. With one thread, there were no failures. See `docs/FAILURES.md`.
+
+### Measured serving performance (localhost)
+
+Hardware: a 12-core Apple Silicon Mac. Docker runs under Colima (4 vCPU, 6 GB). The load generator runs on the same machine, so these numbers are localhost measurements, not networked ones. Each run sends 8,000 requests from 4 client processes with 16 concurrent requests. Source: `docs/results/serving-music4all.json`.
+
+| Setup | Throughput (req/s) | p50 (ms) | p95 (ms) | p99 (ms) | Memory (MB) |
+|---|---|---|---|---|---|
+| 1 uvicorn worker, no cache | 2,057 | 6.96 | 10.72 | 12.62 | 313 |
+| 2 workers, no cache | 3,067 | 4.50 | 7.13 | 8.63 | 669 |
+| 4 workers, no cache | 3,362 | 4.22 | 6.14 | 7.45 | 1,290 |
+| 1 worker, Redis cache (61% hits) | 2,283 | 5.62 | 10.76 | 13.35 | 314 |
+| 2 workers, Redis cache | 3,335 | 3.40 | 7.61 | 9.53 | 670 |
+| 4 workers, Redis cache | 3,292 | 3.35 | 8.38 | 10.38 | 1,286 |
+
+Memory is the total RSS of the server process tree. Each worker loads its own copy of the model, so memory grows with worker count. At four workers, throughput barely rose above two, and the shared client machine is the likely limit. I did not measure that separately. The Redis cache gave a small gain here, because the workload draws from 3,000 users and the hit rate is 61%.
+
+### Two instances behind a load balancer
+
+`docker-compose up --build -d` starts two API containers, Redis, and an nginx load balancer on `localhost:8080`. Each API container has a readiness health check, and nginx retries a failed request on the other instance.
+
+| Test | Result |
+|---|---|
+| Steady load through nginx, 7,700 measured requests | 2,174 req/s, p50 5.65 ms, p95 12.8 ms, p99 17.5 ms, 0 errors |
+| Memory | about 212 MiB per API container (one worker each) |
+| Failover under load: `docker kill` one instance at t=6 s, restart it at t=12 s, then stop the other gracefully at t=19 s | 30,000 requests, 0 client-visible errors. Nginx retries were not logged, so the number of retries is unknown. |
+| Graceful stop under load (`docker-compose stop -t 25`) | exit code 0 in about 1 s; uvicorn logged "Application shutdown complete" |
+
+The Compose run went through the VM network and shared 4 vCPUs between nginx, two APIs, and Redis. It is slower than the multi-process localhost run and is not a production benchmark. I have not run the stack on separate hosts, so cross-host latency and throughput are unmeasured.
+
+### Earlier benchmark (MovieLens artifacts)
+
+These numbers are from the MovieLens model (1,514 MB for 4 workers). They are not music results. Redis lowered throughput there because the hit rate was 2.3%, against 162,000 users. The cold-start path once re-sorted every item per request (0.912 ms). It now uses a popularity order computed at startup (0.002 ms).
 
 | Configuration | Throughput (req/s) | p50 (ms) | p95 (ms) | p99 (ms) | Memory (MB) |
 |---|---|---|---|---|---|
 | 1 worker | 2,589 | 5.44 | 7.79 | 9.28 | 368 |
 | 2 workers | 3,184 | 3.97 | 6.33 | 7.22 | 776 |
-| 4 workers | **3,890** | **3.57** | **5.05** | **6.20** | 1,514 |
+| 4 workers | 3,890 | 3.57 | 5.05 | 6.20 | 1,514 |
 | 4 workers + Redis (flushed) | 3,250 | 4.30 | 6.27 | 7.50 | 1,511 |
-
-Redis reduced throughput here. The hit rate was 2.3%, because the benchmark spreads requests across 162,000 users. The cache helps when a small set of users makes most requests.
-
-**Optimization.** The cold-start path re-sorted every item on every request, which cost 0.912 ms per request. It now uses a popularity order computed at startup, which costs 0.002 ms. LightGBM prediction takes about 64% of personalized request time (about 0.55 ms). Forcing single-threaded prediction made no difference (0.533 → 0.561 ms), so I reverted it.
-
-## Architecture
-
-```
-offline   build sample ─► chronological windows ─► two-tower (stage 1)
-                                                 ─► FAISS index
-          ranker window ─► hybrid candidates ─► LightGBM LambdaRank
-          validation    ─► select diversity penalty (validation only)
-          test          ─► evaluate once ─► docs/results/
-
-online    FastAPI
-          GET  /recommendations/{user_id}      cache ─► FAISS + popular candidates ─► LightGBM ─► top-k
-          GET  /health                          liveness
-          GET  /ready                           readiness (503 if the model is not loaded)
-          DELETE /users/{user_id}/recommendations   bearer token (ADMIN_API_KEY) required
-```
-
-## Modules
-
-| Module | Role |
-|---|---|
-| `music.py` | Music4All-Onion loader: streamed counts, fixed-seed stratified sample, chunked filtering |
-| `music_pipeline.py` | Chronological splits, two-tower, FAISS, SVD baseline, LambdaRank, selection, one test evaluation |
-| `movielens.py` | MovieLens 25M loader (scalability benchmark) |
-| `pipeline.py` | Synthetic and MovieLens pipeline (leave-two-out per user) |
-| `evaluation.py` | Bootstrap and paired intervals, diversity, novelty, coverage, diversity-penalized reranking |
-| `metrics.py` | Recall@K and NDCG@K for one positive and for set relevance |
-| `model.py`, `retrieval.py`, `ranking.py` | Two-tower model, FAISS search, history statistics, hybrid candidates, LightGBM |
-| `service.py`, `api.py`, `cache.py` | Serving, bearer-token deletion, readiness, Redis with fallback |
-| `privacy.py`, `experiments.py` | HMAC pseudonyms for logs; deterministic A/B assignment (no online test run) |
 
 ## Running it
 
@@ -123,58 +129,116 @@ Requires Python 3.11 or newer.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest -q                                                  # 60 tests
+ruff check src scripts tests
+pytest -q                                                  # 78 tests
 
 # Music4All-Onion: download the Zenodo record 15394646 files
 #   userid_trackid_timestamp.tsv.bz2 and id_genres_tf-idf.tsv.bz2 into <music4all dir>
 python scripts/build_music_sample.py --data <music4all dir> --cache cache/music_10k.npz
-python scripts/run_music.py --cache cache/music_10k.npz --out docs/results/music4all-10k
+python scripts/run_music.py --cache cache/music_10k.npz --out docs/results/music4all-10k --export artifacts-music4all-10k
+
+# Serve the Music4All model
+ARTIFACT_DIR=artifacts-music4all-10k PSEUDONYM_KEY=change-me uvicorn rtrec.api:app --port 8000
+curl localhost:8000/ready
+curl "localhost:8000/recommendations/<music4all user id>?k=10"
+
+# Two instances behind nginx, with Redis (needs Docker; compose v2 or docker-compose)
+cp .env.example .env                                       # set PSEUDONYM_KEY and ADMIN_API_KEY
+docker-compose up --build -d                               # http://localhost:8080
+
+# Load and worker benchmarks (localhost)
+python scripts/sample_user_ids.py --artifacts artifacts-music4all-10k --out user_ids.txt
+python scripts/bench_workers.py --artifacts artifacts-music4all-10k --user-ids-file user_ids.txt --workers 1,2,4
 
 # Synthetic and MovieLens benchmarks
 python -m rtrec.pipeline --out artifacts --epochs 15
 python -m rtrec.pipeline --dataset movielens --data ml-25m --out artifacts-ml25m --epochs 2
-
-ARTIFACT_DIR=artifacts PSEUDONYM_KEY=change-me ADMIN_API_KEY=change-me-too uvicorn rtrec.api:app --port 8000
-curl localhost:8000/recommendations/u42?k=10
-curl -X DELETE -H "Authorization: Bearer change-me-too" localhost:8000/users/u42/recommendations
 ```
+
+CI (`.github/workflows/ci.yml`) runs `ruff`, `pytest`, a Docker image build, and a container smoke test on every push.
+
+## Architecture
+
+```
+offline (scripts/run_music.py)
+  sample ─► chronological windows ─► two-tower (stage 1) ─► FAISS index (track vectors)
+                                   ─► user vectors (stage 1)
+  ranker window ─► hybrid candidates (FAISS + popular) ─► LightGBM LambdaRank
+  validation    ─► choose diversity penalty lambda
+  test          ─► evaluate once ─► docs/results/music4all-10k/
+  export        ─► artifacts-music4all-10k/  (weights, index, ranker, vectors, history, ids, config)
+
+online (FastAPI, one process per container)
+  GET /recommendations/{user_id}   Redis cache ─► known user? ─► hybrid candidates ─► LightGBM ─► diversity rerank ─► top-k
+                                                              └─ unknown / untrained ─► catalog popularity (cold_start)
+  GET /health                      liveness
+  GET /ready                       readiness: model loaded and self-checked
+  GET /metrics                     counters and latency percentiles (no user ids)
+  DELETE /users/{id}/recommendations   bearer token (ADMIN_API_KEY) required
+
+deployment (docker-compose.yml)
+  nginx :8080 ─► api1, api2 (read-only artifacts volume, PSEUDONYM_KEY from .env) ─► redis
+```
+
+## Modules
+
+| Module | Role |
+|---|---|
+| `music.py` | Music4All-Onion loader: streamed counts, fixed-seed stratified sample, chunked filtering |
+| `music_pipeline.py` | Chronological splits, two-tower, FAISS, SVD baseline, LambdaRank, selection, one test evaluation, artifact export |
+| `hybrid.py` | Candidate pool, LightGBM scoring, and diversity selection for one user. Shared by evaluation and serving |
+| `movielens.py` | MovieLens 25M loader (scalability benchmark) |
+| `pipeline.py` | Synthetic and MovieLens pipeline (leave-two-out per user) |
+| `evaluation.py` | Bootstrap and paired intervals, diversity, novelty, coverage, diversity-penalized reranking |
+| `metrics.py` | Recall@K and NDCG@K for one positive and for set relevance |
+| `model.py`, `retrieval.py`, `ranking.py` | Two-tower model, FAISS search, history statistics, hybrid candidates, LightGBM |
+| `service.py`, `api.py`, `cache.py`, `telemetry.py` | Serving for both artifact families, readiness self-check, bearer-token deletion, Redis with fallback, metrics |
+| `privacy.py`, `experiments.py` | HMAC pseudonyms for logs; deterministic A/B assignment (no online test run) |
 
 ## Security and privacy
 
 - **Deletion requires authentication.** `DELETE /users/{id}/recommendations` needs a bearer token equal to `ADMIN_API_KEY`. Tests cover a missing token (401), a wrong token (403), a correct token (200), and a disabled endpoint (503). Self-service deletion by users is not implemented.
-- **Logs contain no raw user ids.** They carry an HMAC pseudonym, and a test checks this.
+- **Logs contain no raw user ids.** They carry an HMAC pseudonym, and a test checks this. Every instance in the Compose stack must share one `PSEUDONYM_KEY`. Otherwise the same user gets different pseudonyms on different instances.
+- **Metrics contain no user ids.** `GET /metrics` returns counts and latencies only.
 - **Deletion has limits.** Purging clears cached recommendations. It does not remove a user's data from training artifacts, which needs retraining. See `docs/PRIVACY.md`.
 
 ## Engineering decisions
 
-- **OpenMP workaround.** PyTorch, FAISS, and LightGBM each load an OpenMP runtime, which crashed the process when multi-threaded on macOS. The code pins threads to one and sets `KMP_DUPLICATE_LIB_OK=TRUE`. That flag is an unsupported workaround. Removing it needs builds that share one runtime, which I have not tried.
+- **OpenMP.** FAISS and LightGBM each bundle an OpenMP runtime. Loaded together in one process, LightGBM with four threads crashed (exit 139) in 5 of 5 runs of `scripts/openmp_probe.py`, with and without `KMP_DUPLICATE_LIB_OK`. Torch is not needed to trigger it. With one thread it never crashed. The service now pins LightGBM prediction to one thread. The `KMP_DUPLICATE_LIB_OK=TRUE` setting stays. The probe passed without it in single-thread mode, but I have not run the test suite or the API without it, so I have not shown it is unnecessary. It is an unsupported workaround. The durable fix is one OpenMP runtime shared by all three, which needs source builds I have not tried. See `docs/FAILURES.md`.
 - **Import order.** PyTorch is imported before FAISS.
-- **Benchmark client.** A single Python load generator topped out near 600 req/s, so the benchmark uses four client processes.
+- **Same code offline and online.** Candidate generation, LightGBM scoring, and diversity selection run through `hybrid.py` in both the evaluation and the API. The tests check that the API returns the list the shared functions produce from the saved artifacts.
 - **Chronological splits, not random ones.** Random splits would let the model see the future.
+- **Container image.** Artifacts are mounted read-only, not baked into the image. The container runs as a non-root user. LightGBM needs `libgomp1`, which the slim base image lacks. The first build passed and the container then failed at import, so the build alone does not show a container starts.
 
 ## Limitations
 
-- Offline only. There are no online experiments.
-- Music results come from one 10,000-user sample and one seed. I have not measured variance across seeds or samples.
-- The ranker sees only 4,159 users.
-- The model is trained for two epochs and not tuned.
-- Serving was measured on one machine, with the client and server sharing 12 cores.
-- No artist features (artist metadata was excluded by decision).
-- Multi-instance deployment, CI, Prometheus, failure injection, Docker verification, and multi-region operation are not done.
+- **Offline only.** There are no online experiments, and no real-user outcomes.
+- **One sample, one seed.** Music results come from one 10,000-user sample and one seed. Variance across seeds and samples is not measured.
+- **Frozen user vectors.** Served user vectors come from the stage-1 model. Ranking features and the seen set use the history up to the test cut-off. Nothing updates while the service runs, and new listening needs a retrain.
+- **Two untrained users.** Two of the 10,000 sampled users have no events before the stage-1 cut-off. The API serves them as cold start. One of them has events before the test cut-off, so the reported test pool included that user with an untrained vector. That is one of 2,300 test users. I did not change the reported results.
+- **Ranker data.** The ranker is trained on 4,159 users. Cold-start test users are almost absent (one).
+- **Model.** Two epochs, not tuned. No artist features (excluded by decision). No sequential modeling.
+- **Localhost benchmarks only.** The client and server shared one machine. No networked, cross-host, or multi-region measurements exist.
+- **Failover is not fault-tolerant at the database level.** Redis is a single instance. If it goes down, requests are served without cache, and the API keeps working.
+- **Not done:** Prometheus export (metrics are JSON), distributed tracing, multi-region deployment, automatic model rollout or rollback, and self-service per-user deletion.
 
 ## Project layout
 
 ```
 src/rtrec/                  library
-tests/                      60 tests (data, model, retrieval, ranking, cache, service, API,
+tests/                      78 tests (data, model, retrieval, ranking, cache, service, API,
                             security, privacy, experiments, evaluation, metrics, MovieLens,
-                            music loader and pipeline)
-scripts/                    build_music_sample.py, run_music.py, loadtest.py, bench_workers.py
+                            music loader and pipeline, music serving end-to-end)
+scripts/                    build_music_sample.py, run_music.py, sample_user_ids.py,
+                            loadtest.py, bench_workers.py, openmp_probe.py
+deploy/nginx.conf           load balancer for the two-instance stack
+Dockerfile, docker-compose.yml, .env.example
+.github/workflows/ci.yml    lint, tests, container smoke test
 docs/PRIVACY.md             privacy design, retention, deletion
 docs/EXPERIMENTS.md         offline evaluation and A/B design
-docs/FAILURES.md            failure handling
+docs/FAILURES.md            failure handling and the OpenMP investigation
 docs/PROVENANCE.md          code and dataset license audit
-docs/results/               saved metrics JSON, including the music results
+docs/results/               saved metrics JSON, including the music results and serving benchmarks
 ```
 
 ## License

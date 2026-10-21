@@ -1,4 +1,12 @@
-"""Serving: load artifacts, retrieve with FAISS, rerank with LightGBM, cache, and fall back to popularity."""
+"""Serving: load artifacts, retrieve with FAISS, rerank with LightGBM, cache, and fall back to popularity.
+
+Two artifact families are supported, and config.json says which one is present:
+
+- "generic": synthetic or MovieLens artifacts from rtrec.pipeline. Users are "u<index>" and
+  items are "i<index>".
+- "music4all": artifacts from rtrec.music_pipeline.export_artifacts. Users are Music4All user ids
+  and items are Music4All track ids. Served lists apply the diversity penalty chosen on validation.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -12,10 +20,10 @@ import faiss
 import lightgbm as lgb
 import numpy as np
 
-from . import retrieval
-from .cache import NullCache, RedisCache
-from .artifacts import CONFIG_FILE, FAISS_FILE, HISTORY_FILE, RANKER_FILE, VECTORS_FILE
-from .ranking import History, candidate_features, generate_candidates, predict
+from .artifacts import CATALOG_FILE, CONFIG_FILE, FAISS_FILE, HISTORY_FILE, RANKER_FILE, VECTORS_FILE
+from .cache import NullCache
+from .hybrid import score_pool, select_top_k
+from .ranking import History
 
 log = logging.getLogger(__name__)
 
@@ -44,10 +52,19 @@ class Recommender:
     ttl: int = 300
     stats: Stats = field(default_factory=Stats)
     popularity_order: np.ndarray = field(default=None, repr=False)
+    family: str = "generic"
+    selected_lambda: float = 0.0
+    user_ids: np.ndarray | None = field(default=None, repr=False)      # music4all: sorted original ids
+    item_ids: np.ndarray | None = field(default=None, repr=False)      # music4all: track id per dense item index
+    trained_users: np.ndarray | None = field(default=None, repr=False)  # music4all: False = cold start
 
     def __post_init__(self) -> None:
         if self.popularity_order is None:
             self.popularity_order = np.argsort(-self.history.item_popularity, kind="stable")
+        if self.item_ids is not None and len(self.item_ids) != self.n_items:
+            raise ValueError("catalog size does not match the history artifact")
+        if self.user_ids is not None and len(self.user_ids) != self.n_users:
+            raise ValueError("user list size does not match the history artifact")
 
     @classmethod
     def load(cls, artifact_dir: str | Path, cache: Any | None = None, ttl: int = 300) -> "Recommender":
@@ -66,6 +83,18 @@ class Recommender:
             seen_indptr=hist["seen_indptr"],
             seen_indices=hist["seen_indices"],
         )
+        family = config.get("model_family", "generic")
+        extra: dict[str, Any] = {}
+        if family == "music4all":
+            catalog = np.load(root / CATALOG_FILE)
+            extra = {
+                "user_ids": catalog["user_ids"].astype(np.int64),
+                "item_ids": catalog["item_ids"].astype(str),
+                "trained_users": catalog["trained_users"].astype(bool),
+                "selected_lambda": float(config["selected_lambda"]),
+            }
+        elif family != "generic":
+            raise ValueError(f"unknown model_family: {family}")
         version = hashlib.sha1(config_text.encode()).hexdigest()[:8]
         return cls(
             index=faiss.read_index(str(root / FAISS_FILE)),
@@ -80,7 +109,46 @@ class Recommender:
             version=version,
             cache=cache if cache is not None else NullCache(),
             ttl=ttl,
+            family=family,
+            **extra,
         )
+
+    def self_check(self) -> None:
+        """Score one cold-start request and, when a trained user exists, one personalized request.
+
+        Runs without the cache. Raises if the model cannot produce a full list of catalog items.
+        Load it before readiness is reported, so the first real request does not pay for it.
+        """
+        cold = self._compute("__self_check_cold__", 3)
+        if cold["source"] != "cold_start" or len(cold["items"]) != 3:
+            raise RuntimeError("cold-start path failed self-check")
+        probe = self._probe_user_id()
+        if probe is not None:
+            warm = self._compute(probe, 3)
+            if warm["source"] != "personalized" or len(warm["items"]) != 3:
+                raise RuntimeError("personalized path failed self-check")
+
+    def _probe_user_id(self) -> str | None:
+        if self.user_ids is None:
+            return "u0" if self.n_users > 0 else None
+        trained = np.flatnonzero(self.trained_users)
+        return str(int(self.user_ids[trained[0]])) if trained.size else None
+
+    def _user_index(self, user_id: str) -> int | None:
+        """Dense user index, or None when the user is unknown or has no trained vector."""
+        if self.user_ids is None:
+            user = self.parse_user(user_id)
+            return user if user is not None and user < self.n_users else None
+        if not user_id.isdigit() or len(user_id) > 18:
+            return None
+        value = int(user_id)
+        pos = int(np.searchsorted(self.user_ids, value))
+        if pos < len(self.user_ids) and int(self.user_ids[pos]) == value and self.trained_users[pos]:
+            return pos
+        return None
+
+    def _item_name(self, item: int) -> str:
+        return str(self.item_ids[item]) if self.item_ids is not None else f"i{item}"
 
     def _popular_unseen(self, seen: np.ndarray, exclude: set[int], k: int) -> list[int]:
         blocked = set(seen.tolist()) | exclude
@@ -94,27 +162,30 @@ class Recommender:
 
     def _personalized(self, user: int, k: int) -> list[dict]:
         seen = self.history.seen(user)
-        items, scores, ranks = generate_candidates(
-            self.index, self.user_vecs[user], seen, self.popularity_order, self.item_vecs,
-            self.candidates, self.popular_candidates,
-        )
-        ranked_scores = predict(self.booster, candidate_features(self.history, user, items, scores, ranks))
-        order = np.argsort(-ranked_scores, kind="stable")
-        chosen = [(int(items[j]), float(ranked_scores[j])) for j in order[:k]]
-        if len(chosen) < k:  # fill from popularity when there are too few unseen candidates
+        items, rank_scores = score_pool(self.index, user, self.user_vecs[user], self.history,
+                                        self.popularity_order, self.item_vecs, self.booster,
+                                        self.candidates, self.popular_candidates)
+        chosen = select_top_k(items, rank_scores, self.history, k, self.selected_lambda)
+        if len(chosen) < k:  # fill from popularity when the unseen candidate pool is too small
             extra = self._popular_unseen(seen, {i for i, _ in chosen}, k - len(chosen))
             chosen += [(item, 0.0) for item in extra]
-        return [{"item_id": f"i{item}", "score": round(score, 6)} for item, score in chosen]
+        return [{"item_id": self._item_name(item), "score": round(score, 6)} for item, score in chosen]
 
     def _cold_start(self, k: int) -> list[dict]:
         top = self._popular_unseen(np.empty(0, dtype=np.int64), set(), k)
-        return [{"item_id": f"i{item}", "score": 0.0} for item in top]
+        return [{"item_id": self._item_name(item), "score": 0.0} for item in top]
 
     @staticmethod
     def parse_user(user_id: str) -> int | None:
         if len(user_id) > 1 and user_id[0] == "u" and user_id[1:].isdigit():
             return int(user_id[1:])
         return None
+
+    def _compute(self, user_id: str, k: int) -> dict:
+        user = self._user_index(user_id)
+        if user is None:
+            return {"user_id": user_id, "source": "cold_start", "items": self._cold_start(k)}
+        return {"user_id": user_id, "source": "personalized", "items": self._personalized(user, k)}
 
     def recommend(self, user_id: str, k: int = 10) -> dict:
         self.stats.requests += 1
@@ -124,14 +195,11 @@ class Recommender:
             self.stats.cache_hits += 1
             return {**cached, "cache_hit": True}
 
-        user = self.parse_user(user_id)
-        if user is None or user >= self.n_users:
-            source, items = "cold_start", self._cold_start(k)
+        result = self._compute(user_id, k)
+        if result["source"] == "cold_start":
             self.stats.cold_starts += 1
         else:
-            source, items = "personalized", self._personalized(user, k)
             self.stats.personalized += 1
-        result = {"user_id": user_id, "source": source, "items": items}
         self.cache.set(key, result, self.ttl)
         return {**result, "cache_hit": False}
 

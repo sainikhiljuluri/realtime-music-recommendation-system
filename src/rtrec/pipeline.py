@@ -15,10 +15,10 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import torch  # imported before faiss: importing faiss first crashes torch on macOS (OpenMP)
 import faiss
 import numpy as np
 import pandas as pd
+import torch  # imported before faiss: importing faiss first crashes torch on macOS (OpenMP)
 
 from . import data, movielens, retrieval
 from .artifacts import CONFIG_FILE, FAISS_FILE, HISTORY_FILE, METRICS_FILE, MODEL_FILE, RANKER_FILE, VECTORS_FILE

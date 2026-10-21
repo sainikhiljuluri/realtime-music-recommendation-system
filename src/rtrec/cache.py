@@ -45,6 +45,16 @@ class RedisCache:
         except redis.RedisError:
             return False
 
+    def close(self) -> None:
+        """Release the connection pool on shutdown. Errors here are logged, never raised."""
+        close = getattr(self.client, "close", None)
+        if close is None:
+            return
+        try:
+            close()
+        except redis.RedisError as exc:
+            log.warning("cache close failed: %s", exc)
+
     def get(self, key: str) -> Any | None:
         try:
             raw = self.client.get(key)
