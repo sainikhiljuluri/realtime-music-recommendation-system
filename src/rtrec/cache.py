@@ -23,6 +23,9 @@ class NullCache:
     def set(self, key: str, value: Any, ttl: int) -> None:
         return None
 
+    def delete_matching(self, pattern: str) -> int:
+        return 0
+
 
 class RedisCache:
     available = True
@@ -57,6 +60,15 @@ class RedisCache:
         except redis.RedisError as exc:
             self.errors += 1
             log.warning("cache set failed: %s", exc)
+
+    def delete_matching(self, pattern: str) -> int:
+        try:
+            keys = list(self.client.scan_iter(match=pattern, count=500))
+            return int(self.client.delete(*keys)) if keys else 0
+        except redis.RedisError as exc:
+            self.errors += 1
+            log.warning("cache purge failed: %s", exc)
+            return 0
 
 
 def make_cache(url: str | None) -> RedisCache | NullCache:

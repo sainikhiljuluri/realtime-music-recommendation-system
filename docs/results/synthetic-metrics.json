@@ -1,0 +1,119 @@
+{
+  "k": 10,
+  "candidates": 100,
+  "users_evaluated": 2000,
+  "models": {
+    "random": {
+      "recall_at_k": {
+        "mean": 0.0045,
+        "ci95": [
+          0.0019875000000000006,
+          0.007512499999999988
+        ]
+      },
+      "ndcg_at_k": {
+        "mean": 0.0016884463357108395,
+        "ci95": [
+          0.0006576247197720913,
+          0.0029369333346404972
+        ]
+      },
+      "diversity": 0.6978999999999999,
+      "coverage": 0.9993333333333333
+    },
+    "popularity": {
+      "recall_at_k": {
+        "mean": 0.015,
+        "ci95": [
+          0.0095,
+          0.02051249999999999
+        ]
+      },
+      "ndcg_at_k": {
+        "mean": 0.007852087571979482,
+        "ci95": [
+          0.005087432447364254,
+          0.01098066954787686
+        ]
+      },
+      "diversity": 0.48235,
+      "coverage": 0.006666666666666667
+    },
+    "retrieval": {
+      "recall_at_k": {
+        "mean": 0.053,
+        "ci95": [
+          0.043,
+          0.06301249999999999
+        ]
+      },
+      "ndcg_at_k": {
+        "mean": 0.025326489711624697,
+        "ci95": [
+          0.02026124317552699,
+          0.030670287995747447
+        ]
+      },
+      "diversity": 0.22335000000000002,
+      "coverage": 0.9273333333333333
+    },
+    "ranker": {
+      "recall_at_k": {
+        "mean": 0.1135,
+        "ci95": [
+          0.1,
+          0.1275
+        ]
+      },
+      "ndcg_at_k": {
+        "mean": 0.05516944844135109,
+        "ci95": [
+          0.04774640810794415,
+          0.06344924755978078
+        ]
+      },
+      "diversity": 0.26575000000000004,
+      "coverage": 0.489
+    }
+  },
+  "paired_recall_differences": {
+    "recall_ranker_minus_retrieval": {
+      "mean": 0.0605,
+      "ci95": [
+        0.045,
+        0.076
+      ]
+    },
+    "recall_ranker_minus_popularity": {
+      "mean": 0.0985,
+      "ci95": [
+        0.0845,
+        0.11351249999999999
+      ]
+    },
+    "recall_retrieval_minus_popularity": {
+      "mean": 0.038,
+      "ci95": [
+        0.027,
+        0.05
+      ]
+    }
+  },
+  "dataset": {
+    "name": "synthetic",
+    "users": 2000,
+    "items": 3000,
+    "events_total": 75772,
+    "events_train": 71772,
+    "events_validation": 2000,
+    "events_test": 2000
+  },
+  "training": {
+    "two_tower_and_ranker_seconds": 5.72,
+    "ranker_training_users": 2000,
+    "ranker_training_rows": 300000,
+    "peak_rss_mb": 538.2,
+    "total_seconds": 7.98,
+    "platform": "macOS-26.3-arm64-arm-64bit"
+  }
+}

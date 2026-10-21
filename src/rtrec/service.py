@@ -15,7 +15,7 @@ import numpy as np
 from . import retrieval
 from .cache import NullCache, RedisCache
 from .artifacts import CONFIG_FILE, FAISS_FILE, HISTORY_FILE, RANKER_FILE, VECTORS_FILE
-from .ranking import History, candidate_features, predict
+from .ranking import History, candidate_features, generate_candidates, predict
 
 log = logging.getLogger(__name__)
 
@@ -34,13 +34,20 @@ class Recommender:
     booster: lgb.Booster
     history: History
     user_vecs: np.ndarray
+    item_vecs: np.ndarray
     n_users: int
     n_items: int
     candidates: int
+    popular_candidates: int
     version: str
     cache: Any = field(default_factory=NullCache)
     ttl: int = 300
     stats: Stats = field(default_factory=Stats)
+    popularity_order: np.ndarray = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.popularity_order is None:
+            self.popularity_order = np.argsort(-self.history.item_popularity, kind="stable")
 
     @classmethod
     def load(cls, artifact_dir: str | Path, cache: Any | None = None, ttl: int = 300) -> "Recommender":
@@ -65,19 +72,20 @@ class Recommender:
             booster=lgb.Booster(model_file=str(root / RANKER_FILE)),
             history=history,
             user_vecs=arrays["user_vecs"],
+            item_vecs=arrays["item_vecs"],
             n_users=history.genre_profile.shape[0],
             n_items=history.item_genre.shape[0],
             candidates=int(config["candidates"]),
+            popular_candidates=int(config.get("popular_candidates", 0)),
             version=version,
             cache=cache if cache is not None else NullCache(),
             ttl=ttl,
         )
 
     def _popular_unseen(self, seen: np.ndarray, exclude: set[int], k: int) -> list[int]:
-        order = np.argsort(-self.history.item_popularity, kind="stable")
         blocked = set(seen.tolist()) | exclude
         out: list[int] = []
-        for item in order:
+        for item in self.popularity_order:
             if int(item) not in blocked:
                 out.append(int(item))
                 if len(out) == k:
@@ -86,11 +94,14 @@ class Recommender:
 
     def _personalized(self, user: int, k: int) -> list[dict]:
         seen = self.history.seen(user)
-        items, scores = retrieval.top_unseen(self.index, self.user_vecs[user], seen, self.candidates)
-        ranked_scores = predict(self.booster, candidate_features(self.history, user, items, scores))
+        items, scores, ranks = generate_candidates(
+            self.index, self.user_vecs[user], seen, self.popularity_order, self.item_vecs,
+            self.candidates, self.popular_candidates,
+        )
+        ranked_scores = predict(self.booster, candidate_features(self.history, user, items, scores, ranks))
         order = np.argsort(-ranked_scores, kind="stable")
         chosen = [(int(items[j]), float(ranked_scores[j])) for j in order[:k]]
-        if len(chosen) < k:  # fill from popularity when retrieval has too few unseen items
+        if len(chosen) < k:  # fill from popularity when there are too few unseen candidates
             extra = self._popular_unseen(seen, {i for i, _ in chosen}, k - len(chosen))
             chosen += [(item, 0.0) for item in extra]
         return [{"item_id": f"i{item}", "score": round(score, 6)} for item, score in chosen]
@@ -123,3 +134,7 @@ class Recommender:
         result = {"user_id": user_id, "source": source, "items": items}
         self.cache.set(key, result, self.ttl)
         return {**result, "cache_hit": False}
+
+    def purge_user(self, user_id: str) -> int:
+        """Delete cached recommendations for one user (all k values and model versions)."""
+        return self.cache.delete_matching(f"rec:*:{user_id}:*")

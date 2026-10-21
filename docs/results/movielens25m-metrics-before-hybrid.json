@@ -1,0 +1,119 @@
+{
+  "k": 10,
+  "candidates": 100,
+  "users_evaluated": 20000,
+  "models": {
+    "random": {
+      "recall_at_k": {
+        "mean": 0.0003,
+        "ci95": [
+          0.0001,
+          0.00055
+        ]
+      },
+      "ndcg_at_k": {
+        "mean": 0.00017754621667304016,
+        "ci95": [
+          4.467972647107523e-05,
+          0.000357772701828221
+        ]
+      },
+      "diversity": 0.5767399999999999,
+      "coverage": 0.9930001468500661
+    },
+    "popularity": {
+      "recall_at_k": {
+        "mean": 0.0482,
+        "ci95": [
+          0.04539875,
+          0.0513
+        ]
+      },
+      "ndcg_at_k": {
+        "mean": 0.024154652587445192,
+        "ci95": [
+          0.02257867373738574,
+          0.025821936583510983
+        ]
+      },
+      "diversity": 0.43436499999999995,
+      "coverage": 0.002276176024279211
+    },
+    "retrieval": {
+      "recall_at_k": {
+        "mean": 0.0123,
+        "ci95": [
+          0.01075,
+          0.013851249999999999
+        ]
+      },
+      "ndcg_at_k": {
+        "mean": 0.0057189476343593865,
+        "ci95": [
+          0.0049506170609356515,
+          0.006534332330474925
+        ]
+      },
+      "diversity": 0.238155,
+      "coverage": 0.5049194772137647
+    },
+    "ranker": {
+      "recall_at_k": {
+        "mean": 0.03955,
+        "ci95": [
+          0.03685,
+          0.04205125
+        ]
+      },
+      "ndcg_at_k": {
+        "mean": 0.019662558870028546,
+        "ci95": [
+          0.01821715009054172,
+          0.021128870366265942
+        ]
+      },
+      "diversity": 0.275055,
+      "coverage": 0.2273973273287973
+    }
+  },
+  "paired_recall_differences": {
+    "recall_ranker_minus_retrieval": {
+      "mean": 0.02725,
+      "ci95": [
+        0.02455,
+        0.02985125
+      ]
+    },
+    "recall_ranker_minus_popularity": {
+      "mean": -0.00865,
+      "ci95": [
+        -0.01255,
+        -0.00465
+      ]
+    },
+    "recall_retrieval_minus_popularity": {
+      "mean": -0.0359,
+      "ci95": [
+        -0.03920125,
+        -0.03269625
+      ]
+    }
+  },
+  "dataset": {
+    "name": "movielens",
+    "users": 161821,
+    "items": 40858,
+    "events_total": 12452000,
+    "events_train": 12128358,
+    "events_validation": 161821,
+    "events_test": 161821
+  },
+  "training": {
+    "two_tower_and_ranker_seconds": 303.01,
+    "ranker_training_users": 20000,
+    "ranker_training_rows": 2000000,
+    "peak_rss_mb": 4117.0,
+    "total_seconds": 393.35,
+    "platform": "macOS-26.3-arm64-arm-64bit"
+  }
+}

@@ -14,6 +14,7 @@ import json
 import random
 import statistics
 import time
+from pathlib import Path
 
 import httpx
 
@@ -68,7 +69,8 @@ async def run(args: argparse.Namespace) -> dict:
         wall = time.perf_counter() - started
 
     ok = len(latencies)
-    return {
+    raw = {"_latencies": list(latencies), "_wall": wall, "_cache_hits": cache_hits}
+    return {**raw, 
         "url": args.url,
         "concurrency": args.concurrency,
         "requests": ok + errors,
@@ -94,8 +96,15 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--cold-fraction", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--raw-out", default=None, help="write raw latencies and wall time as JSON")
     args = parser.parse_args()
-    print(json.dumps(asyncio.run(run(args)), indent=2))
+    report = asyncio.run(run(args))
+    if args.raw_out:
+        Path(args.raw_out).write_text(json.dumps({"latencies_ms": report.pop("_latencies"),
+                                                  "wall_seconds": report.pop("_wall"),
+                                                  "errors": report["errors"],
+                                                  "cache_hits": report.pop("_cache_hits")}))
+    print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":

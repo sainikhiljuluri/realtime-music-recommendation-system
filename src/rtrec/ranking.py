@@ -7,6 +7,8 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
+from . import retrieval
+
 FEATURE_NAMES = [
     "retrieval_score",
     "retrieval_rank",
@@ -63,21 +65,48 @@ class History:
         return int(np.diff(self.seen_indptr).max()) if self.seen_indptr.size > 1 else 0
 
 
-def candidate_features(history: History, user: int, items: np.ndarray, scores: np.ndarray) -> np.ndarray:
-    """Build the ranker feature matrix for one user's candidates, in retrieval order."""
+def candidate_features(history: History, user: int, items: np.ndarray, scores: np.ndarray, ranks: np.ndarray) -> np.ndarray:
+    """Build the ranker feature matrix for one user's candidates."""
     n = len(items)
-    ranks = np.arange(1, n + 1, dtype=np.float32)
     genres = history.item_genre[items]
     artists = history.item_artist[items]
     features = np.column_stack([
         scores.astype(np.float32),
-        ranks,
+        ranks.astype(np.float32),
         np.log1p(history.item_popularity[items]),
         history.genre_profile[user, genres],
         history.artist_counts[user, artists],
         np.full(n, np.log1p(history.activity[user]), dtype=np.float32),
     ])
     return features.astype(np.float32)
+
+
+def generate_candidates(index, user_vec: np.ndarray, seen: np.ndarray, popularity_order: np.ndarray,
+                        item_vecs: np.ndarray, n_retrieval: int, n_popular: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Hybrid candidate pool: FAISS top unseen items, plus popular unseen items not already included.
+
+    Popular items get their dot-product score and a retrieval rank of n_retrieval + 1, so the
+    ranker can use them. Training and serving both call this function.
+    """
+    items_r, scores_r = retrieval.top_unseen(index, user_vec, seen, n_retrieval)
+    ranks_r = np.arange(1, len(items_r) + 1, dtype=np.float32)
+    taken = set(seen.tolist()) | set(items_r.tolist())
+    popular: list[int] = []
+    if n_popular > 0:
+        for item in popularity_order:
+            item = int(item)
+            if item not in taken:
+                popular.append(item)
+                taken.add(item)
+                if len(popular) == n_popular:
+                    break
+    popular_arr = np.array(popular, dtype=np.int64)
+    scores_p = (item_vecs[popular_arr] @ user_vec).astype(np.float32) if len(popular_arr) else np.empty(0, np.float32)
+    ranks_p = np.full(len(popular_arr), n_retrieval + 1, dtype=np.float32)
+    items = np.concatenate([items_r.astype(np.int64), popular_arr])
+    scores = np.concatenate([scores_r.astype(np.float32), scores_p])
+    ranks = np.concatenate([ranks_r, ranks_p])
+    return items, scores, ranks
 
 
 def train_ranker(features: np.ndarray, labels: np.ndarray, group_sizes: list[int], seed: int = 0) -> lgb.Booster:
