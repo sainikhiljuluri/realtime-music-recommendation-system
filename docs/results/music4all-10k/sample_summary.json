@@ -1,0 +1,15 @@
+{
+  "users": 10000,
+  "tracks_in_catalog": 109269,
+  "tracks_with_events": 56051,
+  "events": 24484674,
+  "events_per_user_median": 781.5,
+  "genres": 685,
+  "tracks_without_genre": 27,
+  "time_range_utc": [
+    "2005-02-14T15:32:30",
+    "2020-03-20T12:59:27"
+  ],
+  "load_seconds": 398.4,
+  "peak_rss_mb": 3506.47
+}

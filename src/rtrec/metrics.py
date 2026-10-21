@@ -15,3 +15,19 @@ def ndcg_at_k(ranked: list[int], target: int, k: int) -> float:
         if item == target:
             return 1.0 / math.log2(position + 1)
     return 0.0
+
+
+def recall_at_k_set(ranked: list[int], relevant: set[int], k: int) -> float:
+    """Share of a user's relevant items found in the top k (set-valued relevance)."""
+    if not relevant:
+        return 0.0
+    return len(relevant.intersection(ranked[:k])) / len(relevant)
+
+
+def ndcg_at_k_set(ranked: list[int], relevant: set[int], k: int) -> float:
+    """NDCG with binary gains and multiple relevant items."""
+    if not relevant:
+        return 0.0
+    dcg = sum(1.0 / math.log2(pos + 2) for pos, item in enumerate(ranked[:k]) if item in relevant)
+    ideal = sum(1.0 / math.log2(pos + 2) for pos in range(min(k, len(relevant))))
+    return dcg / ideal

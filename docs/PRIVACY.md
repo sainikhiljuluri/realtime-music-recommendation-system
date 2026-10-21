@@ -32,10 +32,12 @@ This document describes what the service stores and logs, how identifiers are ha
 
 `DELETE /users/{user_id}/recommendations` removes all cached recommendations for that user, for every `k` and model version (`Recommender.purge_user`). It returns the pseudonym and the number of entries removed.
 
+**Access control.** The endpoint requires `Authorization: Bearer <ADMIN_API_KEY>`. The key is compared in constant time. A missing token returns 401, a wrong token 403, and if `ADMIN_API_KEY` is not set the endpoint is disabled and returns 503. Tests cover all four cases (`tests/test_security.py`). Users cannot yet delete their own data: that needs per-user tokens, which are not implemented.
+
 What deletion does **not** do:
 - It does not remove the user's rows from training data or model artifacts. Those contain per-user aggregates, so removing a user requires retraining without that user. This is documented, not implemented.
 - It does not remove existing log lines. Log retention handles those.
-- It has no authentication. A real deployment needs user-scoped authentication before this endpoint is exposed.
+- It is admin-only. Self-service deletion by the user needs per-user authentication, which is not implemented.
 
 ## Data minimization
 
@@ -45,6 +47,6 @@ What deletion does **not** do:
 
 ## Not implemented
 
-- Authentication and authorization for user-scoped endpoints
+- Per-user authentication for self-service deletion
 - Differential privacy or other formal privacy guarantees for training
 - Automated log expiry, data-subject access requests, and retraining after deletion

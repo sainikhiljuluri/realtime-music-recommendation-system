@@ -36,3 +36,32 @@ def coverage(recommended: list[list[int]], n_items: int) -> float:
     for ranked in recommended:
         distinct.update(int(i) for i in ranked)
     return len(distinct) / n_items
+
+
+def novelty(ranked_items: list[int], self_information: np.ndarray) -> float:
+    """Mean self-information (bits) of recommended items. Higher means less popular items."""
+    if not ranked_items:
+        return 0.0
+    return float(np.mean(self_information[np.asarray(ranked_items, dtype=np.int64)]))
+
+
+def self_information(play_counts: np.ndarray) -> np.ndarray:
+    """-log2 of a smoothed popularity share. Unplayed items get the highest value."""
+    total = play_counts.sum() + len(play_counts)
+    return -np.log2((play_counts + 1.0) / total)
+
+
+def diversity_rerank(items: np.ndarray, scores: np.ndarray, genres: np.ndarray, k: int, lam: float) -> list[int]:
+    """Greedy reranking: pick the best score minus lam per already-selected item of the same genre."""
+    if lam <= 0:
+        return [int(i) for i in items[np.argsort(-scores, kind="stable")][:k]]
+    remaining = list(range(len(items)))
+    picked: list[int] = []
+    counts: dict[int, int] = {}
+    for _ in range(min(k, len(items))):
+        best = max(remaining, key=lambda j: (scores[j] - lam * counts.get(int(genres[items[j]]), 0), -j))
+        remaining.remove(best)
+        picked.append(int(items[best]))
+        g = int(genres[items[best]])
+        counts[g] = counts.get(g, 0) + 1
+    return picked

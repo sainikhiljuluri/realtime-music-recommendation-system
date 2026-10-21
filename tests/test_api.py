@@ -85,13 +85,15 @@ def test_delete_purges_user_cache_entries(artifacts, monkeypatch):
     from rtrec.cache import RedisCache
 
     monkeypatch.setenv("ARTIFACT_DIR", str(artifacts))
+    monkeypatch.setenv("ADMIN_API_KEY", "test-admin-key")
     fake = fakeredis.FakeRedis()
     monkeypatch.setattr(api_module, "make_cache", lambda url: RedisCache(fake))
     with TestClient(api_module.app) as client:
         client.get("/recommendations/u4", params={"k": 3})
         client.get("/recommendations/u4", params={"k": 5})
         client.get("/recommendations/u9", params={"k": 3})
-        removed = client.delete("/users/u4/recommendations").json()["removed"]
+        auth = {"Authorization": "Bearer test-admin-key"}
+        removed = client.delete("/users/u4/recommendations", headers=auth).json()["removed"]
         assert removed == 2
         assert client.get("/recommendations/u9", params={"k": 3}).json()["cache_hit"] is True
         assert client.get("/recommendations/u4", params={"k": 3}).json()["cache_hit"] is False

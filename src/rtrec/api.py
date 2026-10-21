@@ -4,6 +4,7 @@ ARTIFACT_DIR     directory produced by `python -m rtrec.pipeline` (default: arti
 REDIS_URL        optional, e.g. redis://localhost:6379/0. Without it, no cache is used.
 CACHE_TTL        seconds to keep a cached response (default: 300)
 PSEUDONYM_KEY    secret for pseudonymous ids in logs (see rtrec/privacy.py)
+ADMIN_API_KEY    bearer token required for DELETE. If unset, DELETE returns 503 (disabled).
 
 Endpoints:
   GET    /health                              liveness (process is up)
@@ -13,12 +14,14 @@ Endpoints:
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from .cache import make_cache
@@ -95,7 +98,22 @@ def recommendations(user_id: str, request: Request, k: int = Query(10, ge=1, le=
     return RecommendationResponse(**result)
 
 
-@app.delete("/users/{user_id}/recommendations")
+_bearer = HTTPBearer(auto_error=False)
+
+
+def require_admin(credentials: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> None:
+    """Bearer-token check for destructive operations. Compares in constant time."""
+    expected = os.environ.get("ADMIN_API_KEY")
+    if not expected:
+        raise HTTPException(status_code=503, detail="deletion is disabled: ADMIN_API_KEY is not set")
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="missing bearer token",
+                            headers={"WWW-Authenticate": "Bearer"})
+    if not hmac.compare_digest(credentials.credentials.encode(), expected.encode()):
+        raise HTTPException(status_code=403, detail="invalid token")
+
+
+@app.delete("/users/{user_id}/recommendations", dependencies=[Depends(require_admin)])
 def delete_user_recommendations(user_id: str) -> dict:
     rec = _loaded()
     removed = rec.purge_user(user_id)
